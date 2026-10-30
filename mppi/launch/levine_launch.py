@@ -15,7 +15,18 @@ EXECUTABLE = 'mppi_node.py'
 # `track` tells the skeleton which waypoints to load; add this track's values
 # for the other parameters your node declares, e.g. 'max_speed': 6.0, or give
 # it a full .yaml config file
-PARAMETERS = {'track': 'levine'}
+PARAMETERS = {
+    'track': 'levine',          # loads waypoints/levine.csv
+    'use_sim': True,            # simulator: /ego_racecar/odom -> /drive
+    'odom_topic': '/ego_racecar/odom',
+    'drive_topic': '/drive',
+    'waypoint_file': '',        # '' -> waypoints/levine.csv
+    'speed_scale': 1.35,         # full speed profile of the csv
+    'max_speed': 9.0,           # levine.csv tops out at 4.5 m/s
+    'num_samples': 512,        # T
+    'accel_lead_time': 0.19,
+    'visualize': True,         # keep False for grading; true only to record the sim video
+}
 
 
 def generate_launch_description():
