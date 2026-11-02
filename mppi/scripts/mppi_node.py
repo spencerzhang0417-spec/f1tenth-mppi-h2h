@@ -9,6 +9,16 @@ import rclpy
 from ackermann_msgs.msg import AckermannDriveStamped
 from rclpy.node import Node
 from rclpy.executors import ExternalShutdownException
+import sys
+import types
+try:
+    import numba  # noqa: F401
+except Exception:  # car: numba missing / broken -> run utils' @njit functions as plain Python
+    def _njit(*args, **kwargs):
+        if len(args) == 1 and callable(args[0]) and not kwargs:
+            return args[0]
+        return lambda f: f
+    sys.modules['numba'] = types.SimpleNamespace(njit=_njit)
 from utils import calc_interpolated_ref_trajectory
 
 # TODO CHECK: include needed ROS msg type headers and libraries
@@ -22,6 +32,8 @@ from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Point
 from std_msgs.msg import ColorRGBA
 from visualization_msgs.msg import Marker, MarkerArray
+from sensor_msgs.msg import LaserScan
+from scipy.ndimage import distance_transform_edt
 
 
 @dataclass(frozen=True)
@@ -68,6 +80,16 @@ class MPPIConfig:
     # N_ITER afterwards (the warm start already carries the previous solution)
     N_ITER_COLD: int = 10
     N_ITER: int = 1
+    # obstacle avoidance from /scan (only used when avoid_obstacles is True)
+    OBS_RES: float = 0.05      # [m] cell size of the local grid built from the scan
+    OBS_CELLS: int = 280       # grid is OBS_CELLS x OBS_CELLS around the car (280 * 0.05 = 14 m)
+    # 5 circles of radius 0.17 cover the 0.58 x 0.31 m car (corners are 0.163 m from the end
+    # circles) while staying only 1.5 cm wider than the car, so ~0.4 m gaps are still passable
+    OBS_CIRCLES: tuple = (-0.24, -0.12, 0.0, 0.12, 0.24)  # [m] circle centers along the car
+    OBS_RADIUS: float = 0.17   # [m] circle center closer than this to a scan point = collision
+    OBS_MARGIN: float = 0.22   # [m] start the soft penalty at this clearance
+    OBS_HARD: float = 100.0    # cost per step in collision
+    OBS_SOFT: float = 100.0    # weight on (OBS_MARGIN - d)^2
 
 
 def dynamics(x, u, cfg):
@@ -271,7 +293,30 @@ def _sample(key, U, Sigma, cfg):
     return jnp.clip(u, lo, hi)  # also guards against round-off for truncnorm
 
 
-def _mppi_update(key, U, x0, ref, Sigma, cfg):
+def obstacle_cost(X, obs, cfg):
+    """
+    Added: per-step obstacle cost of one trajectory, shape (H,)
+    :param X: states x_0 ... x_H, shape (H+1, NX)
+    :param obs: (dist, ox, oy) local grid from the scan: dist[r, c] = clearance [m] of the cell
+                whose lower-left corner is (ox + c*res, oy + r*res)
+    """
+    dist, ox, oy = obs
+    n = dist.shape[0]
+    # car footprint = a few circles along the heading (one point would miss the corners)
+    off = jnp.array(cfg.OBS_CIRCLES)                                   # (K,)
+    px = X[1:, 0:1] + jnp.cos(X[1:, 2:3]) * off                        # (H, K)
+    py = X[1:, 1:2] + jnp.sin(X[1:, 2:3]) * off
+    c = jnp.floor((px - ox) / cfg.OBS_RES).astype(jnp.int32)
+    r = jnp.floor((py - oy) / cfg.OBS_RES).astype(jnp.int32)
+    inside = (r >= 0) & (r < n) & (c >= 0) & (c < n)
+    clr = dist[jnp.clip(r, 0, n - 1), jnp.clip(c, 0, n - 1)]
+    clr = jnp.where(inside, clr, cfg.OBS_MARGIN)  # outside the grid: nothing seen, no cost
+    clr = jnp.min(clr, axis=1)                    # the closest circle counts
+    return cfg.OBS_HARD * (clr < cfg.OBS_RADIUS) \
+        + cfg.OBS_SOFT * jnp.maximum(cfg.OBS_MARGIN - clr, 0.0) ** 2
+
+
+def _mppi_update(key, U, x0, ref, Sigma, cfg, obs=None):
     x0 = jnp.asarray(x0, dtype=jnp.float32)
     ref = jnp.asarray(ref, dtype=jnp.float32)
 
@@ -281,7 +326,9 @@ def _mppi_update(key, U, x0, ref, Sigma, cfg):
     X = rollout(x0, u, cfg)                                           # (T, H+1, NX)
     # 3. Score: per-step cost, then cost-to-go
     c = jax.vmap(lambda Xk, uk: cost(Xk, uk, ref, cfg))(X, u)         # (T, H)
-    S = jnp.flip(jnp.cumsum(jnp.flip(c, axis=1), axis=1), axis=1)     # S[k,t] = sum_{t'>=t} c[k,t']
+    if obs is not None:  # added: obstacles seen by the scan
+        c = c + jax.vmap(lambda Xk: obstacle_cost(Xk, obs, cfg))(X)
+    S =jnp.flip(jnp.cumsum(jnp.flip(c, axis=1), axis=1), axis=1)     # S[k,t] = sum_{t'>=t} c[k,t']
     # 4. Weight: normalize each step to [0, 1] over the samples, softmax over the samples
     S_min = jnp.min(S, axis=0, keepdims=True)
     S_max = jnp.max(S, axis=0, keepdims=True)
@@ -307,6 +354,159 @@ def mppi_step_cov(key, U, Sigma, x0, ref, cfg):
     Sigma_new = (1.0 - cfg.COV_ALPHA) * _prior_sigma(cfg) + cfg.COV_ALPHA * Sigma_w
     Sigma_new = Sigma_new + jnp.diag(jnp.array(cfg.COV_MIN_STD) ** 2)[None]
     return U_new, X, w, Sigma_new
+
+
+@partial(jax.jit, static_argnames=("cfg",))
+def mppi_step_obs(key, U, x0, ref, obs, cfg):
+    """Added: mppi_step plus the obstacle cost of the local scan grid obs = (dist, ox, oy)"""
+    U_new, X, w, _ = _mppi_update(key, U, x0, ref, _prior_sigma(cfg), cfg, obs)
+    return U_new, X, w
+
+
+@partial(jax.jit, static_argnames=("cfg",))
+def mppi_step_cov_obs(key, U, Sigma, x0, ref, obs, cfg):
+    """Added: mppi_step_cov plus the obstacle cost"""
+    U_new, X, w, Sigma_w = _mppi_update(key, U, x0, ref, Sigma, cfg, obs)
+    Sigma_new = (1.0 - cfg.COV_ALPHA) * _prior_sigma(cfg) + cfg.COV_ALPHA * Sigma_w
+    Sigma_new = Sigma_new + jnp.diag(jnp.array(cfg.COV_MIN_STD) ** 2)[None]
+    return U_new, X, w, Sigma_new
+
+
+def scan_to_grid(ranges, angles, range_min, px, py, yaw, lidar_offset, cfg, blind_radius=0.8):
+    """
+    Added: LaserScan -> local clearance grid around the car, axis-aligned in the map frame.
+    Only cells the scan has actually seen as empty (between the laser and each return) count
+    as free. Everything else -- the returns, the inside and far side of obstacles, the space
+    behind walls -- counts as blocked, so a gap that only looks open because its far side was
+    never seen is not used. The laser's rear blind spot within blind_radius of the car is free.
+    :return: (dist (OBS_CELLS, OBS_CELLS) float32, ox, oy), same layout as obstacle_cost expects
+    """
+    n, res = cfg.OBS_CELLS, cfg.OBS_RES
+    half = 0.5 * n * res
+    ox, oy = px - half, py - half
+    if len(ranges) == 0:  # no scan (e.g. the warm-up compile): everything free
+        return (jnp.full((n, n), 10.0, dtype=jnp.float32), jnp.float32(ox), jnp.float32(oy))
+    lx0 = px + lidar_offset * np.cos(yaw)
+    ly0 = py + lidar_offset * np.sin(yaw)
+    r_max = 1.5 * half
+    hit = np.isfinite(ranges) & (ranges > range_min) & (ranges < r_max)
+    r_free = np.where(hit, ranges, r_max)
+    r_free = np.where(np.isfinite(r_free), r_free, r_max)
+
+    def to_cells(r, a):
+        wx = lx0 + r * np.cos(yaw + a)
+        wy = ly0 + r * np.sin(yaw + a)
+        col = np.floor((wx - ox) / res).astype(int)
+        row = np.floor((wy - oy) / res).astype(int)
+        keep = (row >= 0) & (row < n) & (col >= 0) & (col < n)
+        return row[keep], col[keep]
+
+    free = np.zeros((n, n), dtype=bool)
+    # free space: points every res/2 along each beam up to the return (the return's own cell
+    # is set back to blocked below; stopping a whole cell short would shrink every gap by 0.1 m)
+    t = np.arange(0.0, r_max, 0.5 * res)                                    # (S,)
+    along = t[None, :] < (r_free[:, None] - 0.25 * res)                     # (B, S)
+    rr, cc = to_cells(np.broadcast_to(t, along.shape)[along],
+                      np.broadcast_to(angles[:, None], along.shape)[along])
+    free[rr, cc] = True
+    # rear blind spot of the laser (outside its field of view) close to the car
+    yy, xx = np.mgrid[0:n, 0:n]
+    cx, cy = (xx + 0.5) * res + ox - px, (yy + 0.5) * res + oy - py
+    b = np.arctan2(cy, cx) - yaw
+    b = np.arctan2(np.sin(b), np.cos(b))
+    free |= (np.hypot(cx, cy) < blind_radius) & ((b < angles[0]) | (b > angles[-1]))
+    # the returns themselves are blocked
+    rr, cc = to_cells(ranges[hit], angles[hit])
+    free[rr, cc] = False
+    dist = distance_transform_edt(free) * res  # distance of every cell to the nearest blocked one
+    return (jnp.asarray(dist, dtype=jnp.float32), jnp.float32(ox), jnp.float32(oy))
+
+
+def obstacle_speed_factor(ranges, angles, range_min, f_min=0.35,
+                          front_half_angle=0.3, front_stop=0.3, front_free=3.0,
+                          side_stop=0.2, side_free=0.6):
+    """
+    Added: reference speed factor in [f_min, 1] from the scan, so the car is already slow
+    when it reaches a narrow gap (braking from 3 m/s takes ~1.5 m):
+      - front: closest return within +-front_half_angle rad, linear from front_stop to front_free
+      - side:  closest return within +-90 deg, linear from side_stop to side_free
+    The smaller of the two wins.
+    """
+    ok = np.isfinite(ranges) & (ranges > range_min)
+
+    def lin(sel, d0, d1):
+        if not sel.any():
+            return 1.0
+        d = float(np.min(ranges[sel]))
+        return float(np.clip(f_min + (1.0 - f_min) * (d - d0) / (d1 - d0), f_min, 1.0))
+
+    f_front = lin(ok & (np.abs(angles) < front_half_angle), front_stop, front_free)
+    f_side = lin(ok & (np.abs(angles) < 0.5 * np.pi), side_stop, side_free)
+    return min(f_front, f_side)
+
+
+def plan_lateral_offsets(path, obs, cfg, need, scan_view=None, start_offset=0.0,
+                         max_offset=1.0, step=0.05, w_smooth=2.0):
+    """
+    Added: bend the reference around obstacles. For the next few meters of the waypoint path
+    (path: (M, 4) [x, y, yaw, v], ~0.1 m apart) pick a sideways offset at every point by dynamic
+    programming over a grid of offsets, so that every point keeps >= need clearance in the scan
+    grid and the offset changes by at most one grid step (step) per point (a smooth curve the car
+    can follow). One offset for the whole horizon cannot pass a slalom; a per-point one can.
+      cost = sum |offset| + w_smooth * |change| ; blocked cells cost 1e3 (soft, so DP always ends)
+    A shifted point must also be in front of the scan return in its direction (not behind a wall),
+    unless no offset at that point is visible at all (e.g. around a corner): then the grid decides.
+    :return: offsets (M,)
+    """
+    dist = np.asarray(obs[0]); ox, oy = float(obs[1]), float(obs[2])
+    n = dist.shape[0]
+    offs = np.arange(-max_offset, max_offset + 1e-9, step)                   # (K,)
+    nx, ny = -np.sin(path[:, 2]), np.cos(path[:, 2])                         # left normals
+    px = path[:, 0:1] + offs[None, :] * nx[:, None]                          # (M, K)
+    py = path[:, 1:2] + offs[None, :] * ny[:, None]
+    c = np.floor((px - ox) / cfg.OBS_RES).astype(int)
+    r = np.floor((py - oy) / cfg.OBS_RES).astype(int)
+    inside = (r >= 0) & (r < n) & (c >= 0) & (c < n)
+    clr = np.full(px.shape, np.inf)
+    clr[inside] = dist[r[inside], c[inside]]
+    free = clr >= need
+    if scan_view is not None:
+        ranges, angles, lx, ly, yaw = scan_view
+        d = np.hypot(px - lx, py - ly)
+        b = np.arctan2(py - ly, px - lx) - yaw
+        b = np.arctan2(np.sin(b), np.cos(b))
+        in_fov = (b >= angles[0]) & (b <= angles[-1])
+        idx = np.clip(np.round((b - angles[0]) / (angles[1] - angles[0])).astype(int), 0, len(angles) - 1)
+        rr = ranges[idx]
+        seen = ~in_fov | ~np.isfinite(rr) | (d < rr - 0.1)
+        any_seen = seen.any(axis=1, keepdims=True)
+        free &= seen | ~any_seen
+    M, K = free.shape
+    node = np.abs(offs)[None, :] + np.where(free, 0.0, 1e3)                  # (M, K)
+    k0 = int(np.argmin(np.abs(offs - start_offset)))
+    INF = 1e12
+    J = np.full(K, INF); J[k0] = node[0, k0]
+    back = np.zeros((M, K), dtype=int)
+    for m in range(1, M):
+        best = np.full(K, INF); arg = np.zeros(K, dtype=int)
+        for dk in (-1, 0, 1):                                                # max one step per point
+            prev = np.roll(J, dk)
+            if dk == 1:
+                prev[0] = INF
+            elif dk == -1:
+                prev[-1] = INF
+            cand = prev + w_smooth * step * abs(dk)
+            better = cand < best
+            best[better] = cand[better]
+            arg[better] = (np.arange(K) - dk)[better]
+        J = best + node[m]
+        back[m] = arg
+    k = int(np.argmin(J))
+    out = np.empty(M)
+    for m in range(M - 1, -1, -1):
+        out[m] = offs[k]
+        k = back[m, k]
+    return out
 
 
 _simulate_jit = jax.jit(simulate, static_argnames=("cfg",))  # for visualization only
@@ -466,10 +666,23 @@ class MPPI(Node):
         # The simulator's speed controller is proportional (gain ~4.76 when speeding up), so
         # v + a0*DT only gives ~0.7 m/s^2; 0.21 s (= 1/4.76) gives the planned acceleration.
         self.declare_parameter('accel_lead_time', float(MPPIConfig.DT))
+        # added: MPPI weights / sampling as ROS parameters (defaults = MPPIConfig)
+        self.declare_parameter('Q', list(MPPIConfig.Q))
+        self.declare_parameter('Qf', list(MPPIConfig.Qf))
+        self.declare_parameter('R', list(MPPIConfig.R))
+        self.declare_parameter('Rd', list(MPPIConfig.Rd))
+        self.declare_parameter('lambda', float(MPPIConfig.LAMBDA))
+        self.declare_parameter('u_std', list(MPPIConfig.U_STD))
+        # added: waypoint direction. 'auto' = the track table (levine -> counter-clockwise, the
+        # graded direction), 'keep' = as recorded in the csv, 'ccw' / 'cw' = force
+        self.declare_parameter('waypoint_direction', 'auto')
 
         # ---- waypoints ----
         wp_dir = os.path.join(get_package_share_directory('mppi'), 'waypoints')
-        opts = WAYPOINTS.get(track, WAYPOINTS['levine'])
+        opts = dict(WAYPOINTS.get(track, WAYPOINTS['levine']))
+        direction = str(self.get_parameter('waypoint_direction').value).lower()
+        if direction in ('keep', 'ccw', 'cw'):
+            opts['ccw'] = {'keep': None, 'ccw': True, 'cw': False}[direction]
         wp_path = os.path.join(wp_dir, self.get_parameter('waypoint_file').value or f'{track}.csv')
         if not os.path.isfile(wp_path):
             self.get_logger().warn(f'{wp_path} not found, using {opts["fallback"]}')
@@ -506,7 +719,13 @@ class MPPI(Node):
 
         # added: ROS-parameter overrides of the config (new config -> compile once more)
         overrides = dict(MAX_SPEED=float(self.get_parameter('max_speed').value),
-                         T=int(self.get_parameter('num_samples').value))
+                         T=int(self.get_parameter('num_samples').value),
+                         Q=tuple(float(q) for q in self.get_parameter('Q').value),
+                         Qf=tuple(float(q) for q in self.get_parameter('Qf').value),
+                         R=tuple(float(q) for q in self.get_parameter('R').value),
+                         Rd=tuple(float(q) for q in self.get_parameter('Rd').value),
+                         LAMBDA=float(self.get_parameter('lambda').value),
+                         U_STD=tuple(float(q) for q in self.get_parameter('u_std').value))
         if any(getattr(self.config, k) != val for k, val in overrides.items()):
             self.config = dataclasses.replace(self.config, **overrides)
             mppi_step(self.key, self.U, np.zeros(self.config.NX),
@@ -529,6 +748,56 @@ class MPPI(Node):
         self.last_log = 0.0
         self.last_cb = None   # wall time of the previous control step
         self.max_gap = 0.0    # longest gap between control steps since the last log line
+
+        # ---- added: obstacle avoidance from /scan ----
+        self.declare_parameter('avoid_obstacles', False)  # False = original behavior (autograder)
+        self.declare_parameter('scan_topic', '/scan')
+        # laser position ahead of the odom point [m]: sim = scan_distance_to_base_link in sim.yaml
+        self.declare_parameter('lidar_offset', 0.0 if self.use_sim else 0.27)
+        self.declare_parameter('steer_std', 0.2)  # wider steering samples so detours get sampled
+        # clearance [m] of each footprint circle to the nearest scan point: < obs_radius = collision,
+        # < obs_margin = soft penalty. 0.17 covers the car (half width 0.155 m)
+        self.declare_parameter('obs_radius', 0.17)
+        self.declare_parameter('obs_margin', 0.22)
+        # reference speed x factor in [slow_min_factor, 1] from the closest scan return ahead
+        self.declare_parameter('slow_near_obstacles', True)
+        self.declare_parameter('slow_min_factor', 0.2)
+        # shift the reference sideways when it runs through an obstacle (avoids getting stuck)
+        self.declare_parameter('shift_ref', True)
+        self.declare_parameter('bend_lookahead', 4.0)  # [m] of path the offsets are planned over
+        self.declare_parameter('bend_extra', 0.03)     # [m] bent path keeps obs_radius + this clearance
+        # stuck recovery: back up when standing still for stuck_time s
+        self.declare_parameter('recovery', False)   # experimental: unreliable in tests, off
+        self.declare_parameter('stuck_time', 1.0)       # [s]
+        self.declare_parameter('reverse_time', 0.7)     # [s]
+        self.declare_parameter('reverse_speed', -0.6)   # [m/s]
+        self.stuck_since = None
+        self.recover_until = None
+        self.recover_steer = 0.0
+        self.avoid = bool(self.get_parameter('avoid_obstacles').value)
+        self.lidar_offset = float(self.get_parameter('lidar_offset').value)
+        self.scan = None  # (ranges, angles, range_min) of the newest scan
+        if self.avoid:
+            self.scan_sub = self.create_subscription(
+                LaserScan, self.get_parameter('scan_topic').value, self.scan_callback, qos)
+            # the scan already sees the walls; the off-track penalty would only fight the detours
+            self.config = dataclasses.replace(
+                self.config, OFFTRACK_PENALTY=0.0,
+                U_STD=(self.config.U_STD[0], float(self.get_parameter('steer_std').value)),
+                OBS_RADIUS=float(self.get_parameter('obs_radius').value),
+                OBS_MARGIN=float(self.get_parameter('obs_margin').value))
+            cfg = self.config
+            self.Sigma = _prior_sigma(cfg)
+            empty = scan_to_grid(np.array([]), np.array([]), 0.0, 0.0, 0.0, 0.0, 0.0, cfg)
+            z_x, z_ref = np.zeros(cfg.NX), np.zeros((cfg.H + 1, cfg.NX))
+            mppi_step(self.key, self.U, z_x, z_ref, cfg)  # compile now, not while driving
+            if cfg.ADAPTIVE_COV:
+                mppi_step_cov_obs(self.key, self.U, self.Sigma, z_x, z_ref, empty, cfg)
+            else:
+                mppi_step_obs(self.key, self.U, z_x, z_ref, empty, cfg)
+            self.get_logger().info(f'obstacle avoidance ON: {self.get_parameter("scan_topic").value}, '
+                                   f'lidar_offset {self.lidar_offset} m, steer_std {cfg.U_STD[1]}, '
+                                   f'obs_radius {cfg.OBS_RADIUS}, obs_margin {cfg.OBS_MARGIN}')
 
     def odom_callback(self, odom_msg):
         cfg = self.config
@@ -588,6 +857,21 @@ class MPPI(Node):
                 self.last_t += n * cfg.DT
         self.last_xy = (p.x, p.y)
 
+        # added: local clearance grid from the newest scan, placed with the measured pose
+        # (not the latency-compensated x0: the scan was taken where the car is now)
+        obs = None
+        if self.avoid and self.scan is not None:
+            ranges, angles, range_min = self.scan
+            obs = scan_to_grid(ranges, angles, range_min, p.x, p.y, yaw, self.lidar_offset, cfg)
+            if self.get_parameter('shift_ref').value:
+                ref = self.bend_ref(np.asarray(ref, dtype=float), p.x, p.y, yaw, obs,
+                                    (ranges, angles), cfg)
+            if self.get_parameter('slow_near_obstacles').value:
+                f = obstacle_speed_factor(ranges, angles, range_min,
+                                          f_min=float(self.get_parameter('slow_min_factor').value))
+                ref = np.array(ref, dtype=float)
+                ref[:, 3] *= f  # ref columns: x, y, yaw, v
+
         # a new random key at every step, so MPPI draws new samples
         self.key, subkey = jax.random.split(self.key)
         # TODO: run MPPI, keep the new mean control sequence in self.U
@@ -597,7 +881,12 @@ class MPPI(Node):
         for it in range(n_iter):
             if it > 0:
                 self.key, subkey = jax.random.split(self.key)
-            if cfg.ADAPTIVE_COV:
+            if obs is not None:  # added: same update plus the obstacle cost
+                if cfg.ADAPTIVE_COV:
+                    self.U, X, w, self.Sigma = mppi_step_cov_obs(subkey, self.U, self.Sigma, x0, ref, obs, cfg)
+                else:
+                    self.U, X, w = mppi_step_obs(subkey, self.U, x0, ref, obs, cfg)
+            elif cfg.ADAPTIVE_COV:
                 self.U, X, w, self.Sigma = mppi_step_cov(subkey, self.U, self.Sigma, x0, ref, cfg)
             else:
                 self.U, X, w = mppi_step(subkey, self.U, x0, ref, cfg)
@@ -612,6 +901,29 @@ class MPPI(Node):
         drive.drive.steering_angle = delta0
         lead = float(self.get_parameter('accel_lead_time').value) if a0 > 0.0 else cfg.DT
         drive.drive.speed = float(np.clip(v + a0 * lead, cfg.MIN_SPEED, cfg.MAX_SPEED))
+        # added: stuck recovery. MPPI only drives forward, so in a spot where every forward
+        # trajectory collides (e.g. pointing at an obstacle in a tight turn) it just stops.
+        # After stuck_time s standing still, back up for reverse_time s with the steering
+        # opposite to what MPPI wants: reversing that way turns the nose toward the way out.
+        if self.avoid and self.get_parameter('recovery').value:
+            if self.recover_until is not None and t < self.recover_until:
+                drive.drive.speed = float(self.get_parameter('reverse_speed').value)
+                drive.drive.steering_angle = self.recover_steer
+            else:
+                if self.recover_until is not None:  # recovery just ended: plan from scratch
+                    self.recover_until = None
+                    self.U = jnp.zeros((cfg.H, cfg.NU))
+                    self.cold = True
+                if abs(v) < 0.05 and float(ref[0, 3]) > 0.1:
+                    if self.stuck_since is None:
+                        self.stuck_since = t
+                    elif t - self.stuck_since > float(self.get_parameter('stuck_time').value):
+                        self.recover_until = t + float(self.get_parameter('reverse_time').value)
+                        self.recover_steer = -cfg.MAX_STEER if delta0 >= 0.0 else cfg.MAX_STEER
+                        self.stuck_since = None
+                        self.get_logger().warn('stuck -> backing up')
+                else:
+                    self.stuck_since = None
         self.drive_pub.publish(drive)
         self.last_cmd = (a0, delta0)
 
@@ -636,6 +948,44 @@ class MPPI(Node):
             self.publish_markers(odom_msg.header.frame_id or 'map', x0, ref, X, w)
 
     # ------------------------------------------------------------------ added
+    def bend_ref(self, ref, px, py, yaw, obs, scan, cfg):
+        """
+        added: plan sideways offsets along the next bend_lookahead meters of the waypoints,
+        starting from the car's own sideways position, and move each reference point by the
+        offset at its distance along the path
+        """
+        wps = self.waypoints
+        N = len(wps)
+        i0 = int(np.argmin(np.hypot(wps[:, 0] - px, wps[:, 1] - py)))
+        ds = float(np.mean(np.hypot(np.diff(wps[:50, 0]), np.diff(wps[:50, 1]))))
+        M = max(int(float(self.get_parameter('bend_lookahead').value) / ds), 5)
+        path = wps[(i0 + np.arange(M)) % N]
+        # the car's own sideways offset from the path, so the bent path starts at the car
+        nx, ny = -np.sin(path[0, 2]), np.cos(path[0, 2])
+        start = (px - path[0, 0]) * nx + (py - path[0, 1]) * ny
+        lx = px + self.lidar_offset * np.cos(yaw)
+        ly = py + self.lidar_offset * np.sin(yaw)
+        need = cfg.OBS_RADIUS + float(self.get_parameter('bend_extra').value)
+        o_path = plan_lateral_offsets(path, obs, cfg, need=need,
+                                      scan_view=(scan[0], scan[1], lx, ly, yaw), start_offset=start)
+        # distance of every reference point along the path, measured from path[0]
+        tx, ty = np.cos(path[0, 2]), np.sin(path[0, 2])
+        s0 = (ref[0, 0] - path[0, 0]) * tx + (ref[0, 1] - path[0, 1]) * ty
+        s_ref = s0 + np.r_[0.0, np.cumsum(np.hypot(np.diff(ref[:, 0]), np.diff(ref[:, 1])))]
+        o_ref = np.interp(s_ref, np.arange(M) * ds, o_path)
+        out = np.array(ref, dtype=float)
+        out[:, 0] += o_ref * -np.sin(ref[:, 2])
+        out[:, 1] += o_ref * np.cos(ref[:, 2])
+        self.last_bent_path = np.c_[path[:, 0] - o_path * np.sin(path[:, 2]),
+                                    path[:, 1] + o_path * np.cos(path[:, 2])]
+        return out
+
+    def scan_callback(self, msg):
+        """added: keep the newest scan (ranges + beam angles) for the obstacle grid"""
+        ranges = np.asarray(msg.ranges, dtype=np.float64)
+        angles = msg.angle_min + msg.angle_increment * np.arange(len(ranges))
+        self.scan = (ranges, angles, float(msg.range_min))
+
     def speed_callback(self, msg):
         """real car only: forward speed from the VESC odometry"""
         self.measured_speed = msg.twist.twist.linear.x
@@ -664,6 +1014,9 @@ class MPPI(Node):
             arr.markers.append(line(i, X[k, :, :2], ColorRGBA(r=float(s), g=0.2, b=float(1 - s),
                                                              a=float(0.3 + 0.7 * s)), 0.04))
         arr.markers.append(line(n_show, ref[:, :2], ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0), 0.10))
+        if getattr(self, 'last_bent_path', None) is not None:  # added: planned detour (cyan)
+            arr.markers.append(line(n_show + 2, self.last_bent_path,
+                                    ColorRGBA(r=0.0, g=0.8, b=1.0, a=0.8), 0.05))
         nominal = np.asarray(_simulate_jit(x0, self.U, cfg))
         arr.markers.append(line(n_show + 1, nominal[:, :2], ColorRGBA(r=1.0, g=0.8, b=0.0, a=1.0), 0.10))
         self.vis_pub.publish(arr)
