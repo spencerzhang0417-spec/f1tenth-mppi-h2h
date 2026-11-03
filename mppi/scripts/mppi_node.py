@@ -28,9 +28,9 @@ import os
 import time
 import re
 from collections import deque
-from rclpy.qos import QoSProfile
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from ament_index_python.packages import get_package_share_directory
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, OccupancyGrid
 from geometry_msgs.msg import Point
 from std_msgs.msg import ColorRGBA
 from visualization_msgs.msg import Marker, MarkerArray
@@ -526,9 +526,39 @@ def plan_lateral_offsets(path, obs, cfg, need, scan_view=None, start_offset=0.0,
     lead=0, hold_blind=False is the original planner.
     :return: offsets (M,)
     """
+    offs = np.arange(-max_offset, max_offset + 1e-9, step)                   # (K,)
+    node = _offset_costs(path, obs, cfg, need, offs, scan_view, lead, hold_blind)
+    M, K = node.shape
+    k0 = int(np.argmin(np.abs(offs - start_offset)))
+    INF = 1e12
+    J = np.full(K, INF); J[k0] = node[0, k0]
+    back = np.zeros((M, K), dtype=int)
+    # max one step per point: offset k comes from k+1, k or k-1 (rows dk = -1, 0, 1 below).
+    # One (3, K) array per point instead of a np.roll per move (np.roll was ~70% of the time)
+    k_idx = np.arange(K)
+    move = (w_smooth * step * np.array([1.0, 0.0, 1.0]))[:, None]          # (3, 1)
+    Jp = np.full(K + 2, INF)                                                 # J padded by INF
+    for m in range(1, M):
+        Jp[1:-1] = J
+        cand = np.stack((Jp[2:], Jp[1:-1], Jp[:-2])) + move                 # (3, K)
+        d = np.argmin(cand, axis=0)                                          # first min wins
+        J = cand[d, k_idx] + node[m]
+        back[m] = k_idx - (d - 1)                                            # k - dk
+    k = int(np.argmin(J))
+    out = np.empty(M)
+    for m in range(M - 1, -1, -1):
+        out[m] = offs[k]
+        k = back[m, k]
+    return out
+
+
+def _offset_costs(path, obs, cfg, need, offs, scan_view=None, lead=0, hold_blind=False):
+    """
+    Added: cost of every (path point, sideways offset) for the detour planners, shape (M, K):
+    |offset| + 1e3 where the offset is blocked (see plan_lateral_offsets for scan_view / lead / hold_blind)
+    """
     dist = np.asarray(obs[0]); ox, oy = float(obs[1]), float(obs[2])
     n = dist.shape[0]
-    offs = np.arange(-max_offset, max_offset + 1e-9, step)                   # (K,)
     nx, ny = -np.sin(path[:, 2]), np.cos(path[:, 2])                         # left normals
     px = path[:, 0:1] + offs[None, :] * nx[:, None]                          # (M, K)
     py = path[:, 1:2] + offs[None, :] * ny[:, None]
@@ -564,26 +594,251 @@ def plan_lateral_offsets(path, obs, cfg, need, scan_view=None, start_offset=0.0,
         blocked = blocked | spread
     node = np.abs(offs)[None, :] + np.where(blocked, 1e3, 0.0)               # (M, K)
     node[blind] = 0.0
-    k0 = int(np.argmin(np.abs(offs - start_offset)))
+    return node
+
+
+def plan_lateral_offsets_curv(path, obs, cfg, need, start_offset=0.0, start_slope=0.0,
+                              kmax_left=1.0, kmax_right=1.0, max_offset=1.0, station=0.5, step=0.1,
+                              max_slope=0.5, w_smooth=2.0, lead=0, hold_blind=False, prev=None, w_prev=0.0):
+    """
+    Added: plan_lateral_offsets with the car's turning limit. bags wobble_1103_1647 (99 s / 163 s): an
+    obstacle on the apex of a hairpin the waypoints already drive at ~R 1.07 m (the car's limit ~1.05 m).
+    The point-by-point DP picked the inside gap but has no idea of curvature, so the bent path asked for
+    a much tighter turn than the car can do, and MPPI hesitated between straight and full left until it
+    was too late. Here the offsets are chosen on stations `station` m apart, and every three stations
+    in a row form a curve whose curvature must stay within [-kmax_right, kmax_left] (left > 0). The
+    first curve starts at the car: its offset (start_offset) and heading (start_slope = tan(yaw - path
+    yaw)), so an inside line that should have been started earlier is seen as undrivable.
+      cost = sum |offset| + w_smooth * |change| (+ w_prev * |offset - prev|) per path point,
+             + 1e3 for every blocked point or too sharp curve (soft, so the DP always ends)
+    prev: the last plan on the current path points (nan where none): w_prev > 0 keeps the side chosen
+    in the last control steps instead of flipping between two detours from one scan to the next.
+    :return: offsets (M,), True if no point is blocked and every curve is drivable
+    """
+    M = len(path)
+    ds = float(np.mean(np.hypot(np.diff(path[:, 0]), np.diff(path[:, 1])))) if M > 1 else 0.1
+    fstep = 0.05
+    offs_f = np.arange(-max_offset, max_offset + 1e-9, fstep)               # fine grid of the costs
+    node = _offset_costs(path, obs, cfg, need, offs_f, None, lead, hold_blind)
+    if prev is not None and w_prev > 0.0:
+        has = np.isfinite(prev)
+        node[has] += w_prev * np.abs(offs_f[None, :] - prev[has, None])
+    L = max(1, int(round(station / ds)))
+    sta = np.arange(0, M, L)
+    if len(sta) < 3:
+        return np.full(M, float(np.clip(start_offset, -max_offset, max_offset))), True
+    offs = np.arange(-max_offset, max_offset + 1e-9, step)                   # (K,) station offsets
+    K = len(offs)
+    nx, ny = -np.sin(path[:, 2]), np.cos(path[:, 2])
+    SX = path[sta, 0:1] + offs[None, :] * nx[sta, None]                       # (S, K) station points
+    SY = path[sta, 1:2] + offs[None, :] * ny[sta, None]
     INF = 1e12
-    J = np.full(K, INF); J[k0] = node[0, k0]
-    back = np.zeros((M, K), dtype=int)
-    # max one step per point: offset k comes from k+1, k or k-1 (rows dk = -1, 0, 1 below).
-    # One (3, K) array per point instead of a np.roll per move (np.roll was ~70% of the time)
-    k_idx = np.arange(K)
-    move = (w_smooth * step * np.array([1.0, 0.0, 1.0]))[:, None]          # (3, 1)
-    Jp = np.full(K + 2, INF)                                                 # J padded by INF
-    for m in range(1, M):
-        Jp[1:-1] = J
-        cand = np.stack((Jp[2:], Jp[1:-1], Jp[:-2])) + move                 # (3, K)
-        d = np.argmin(cand, axis=0)                                          # first min wins
-        J = cand[d, k_idx] + node[m]
-        back[m] = k_idx - (d - 1)                                            # k - dk
-    k = int(np.argmin(J))
-    out = np.empty(M)
-    for m in range(M - 1, -1, -1):
-        out[m] = offs[k]
-        k = back[m, k]
+
+    def edge(j):
+        """(K, K) cost of going from offset k at station j to k' at station j+1"""
+        m0, m1 = sta[j], sta[j + 1]
+        do = offs[None, :] - offs[:, None]
+        c = w_smooth * np.abs(do) + np.where(np.abs(do) > max_slope * (m1 - m0) * ds + 1e-9, INF, 0.0)
+        for m in range(m0 + 1, m1 + 1):
+            o = offs[:, None] + do * (m - m0) / (m1 - m0)
+            kf = np.clip(np.round((o + max_offset) / fstep).astype(int), 0, len(offs_f) - 1)
+            c = c + node[m, kf]
+        return c
+
+    def kappa(ax, ay, bx, by, cx, cy):
+        """signed curvature of the circle through a, b, c (left > 0)"""
+        cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+        den = np.hypot(bx - ax, by - ay) * np.hypot(cx - bx, cy - by) * np.hypot(cx - ax, cy - ay) + 1e-9
+        return 2.0 * cross / den
+
+    # the waypoints themselves are driven every lap: a station may always be as sharp as the waypoints
+    # there (their hairpin is ~R 1.07 m, right at the car's limit, and the 3-point estimate scatters)
+    i_mid = int(np.argmin(np.abs(offs)))
+    k_base = np.zeros(len(sta))
+    k_base[1:-1] = kappa(SX[:-2, i_mid], SY[:-2, i_mid], SX[1:-1, i_mid], SY[1:-1, i_mid], SX[2:, i_mid], SY[2:, i_mid])
+    k_base[0] = k_base[1]
+    lim_l = np.maximum(kmax_left, 1.05 * k_base)
+    lim_r = np.maximum(kmax_right, -1.05 * k_base)
+
+    def curv_cost(j, ax, ay, bx, by, cx, cy):
+        """1e3 (+ the relative excess) where the curve at station j is sharper than the car can turn"""
+        kap = kappa(ax, ay, bx, by, cx, cy)
+        over = np.maximum(kap - lim_l[j], 0.0) / lim_l[j] + np.maximum(-kap - lim_r[j], 0.0) / lim_r[j]
+        return np.where(over > 0.0, 1e3 * (1.0 + over), 0.0)
+
+    # station 0 is the car; the point one station behind it continues the car's heading
+    k0 = int(np.argmin(np.abs(offs - start_offset)))
+    tx, ty = np.cos(path[0, 2]), np.sin(path[0, 2])
+    o_back = offs[k0] - start_slope * L * ds
+    bx0 = path[0, 0] - L * ds * tx + o_back * nx[0]
+    by0 = path[0, 1] - L * ds * ty + o_back * ny[0]
+    J = np.full((K, K), INF)                                                   # J[k_prev, k_cur]
+    J[k0, :] = edge(0)[k0] + curv_cost(0, bx0, by0, SX[0, k0], SY[0, k0], SX[1], SY[1])
+    backs = []
+    for j in range(1, len(sta) - 1):
+        cc = curv_cost(j, SX[j - 1][:, None, None], SY[j - 1][:, None, None], SX[j][None, :, None],
+                       SY[j][None, :, None], SX[j + 1][None, None, :], SY[j + 1][None, None, :])
+        tot = J[:, :, None] + cc                                               # (kp, k, kn)
+        bp = np.argmin(tot, axis=0)                                            # (k, kn)
+        J = np.take_along_axis(tot, bp[None], axis=0)[0] + edge(j)
+        backs.append(bp)
+    kp, kc = np.unravel_index(int(np.argmin(J)), J.shape)
+    best = float(J[kp, kc])
+    ks = [kc, kp]
+    for bp in reversed(backs):
+        ks.append(int(bp[ks[-1], ks[-2]]))
+    ks = ks[::-1]                                                              # one per station
+    out = np.interp(np.arange(M), sta[:len(ks)], offs[ks])
+    return out, best < 1e3
+
+
+class MapObstacles:
+    """
+    Added: what the obstacle grid knows besides the newest scan.
+    scan_to_grid only trusts space the scan has seen empty, so the gap behind/inside an obstacle on the
+    apex of a hairpin stays blocked until the car is through the turn (bag wobble_1103_1647: the inside
+    line looked impossible from the entry straight, then possible 1.7 m before the obstacle -- too late).
+    Here the static map (the particle filter's /map) says where the walls are, so unseen cells are free
+    unless the map has a wall there, and a short memory keeps the obstacles that are not in the map:
+      - every scan return not on a map wall counts as a hit; hits fade by `decay` per scan and a cell is
+        an obstacle while it has >= hit_thresh (one stray return is not enough, a stationary box is)
+      - cells a beam has passed through are cleared (moved obstacles, floor returns seen from closer)
+      - a return is assumed to be the front of a box `depth` m deep along the beam (its back is unseen)
+    Map layout as nav_msgs/OccupancyGrid: cell (r, c) covers x >= ox + c*res, y >= oy + r*res.
+    """
+    def __init__(self, wall, res, ox, oy, wall_margin=0.15, decay=0.8, hit_thresh=1.5, mem_range=3.0,
+                 depth=0.3):
+        self.wall = np.asarray(wall, dtype=bool)             # wall or unknown
+        self.res, self.ox, self.oy = float(res), float(ox), float(oy)
+        self.wall_dist = (distance_transform_edt(~self.wall) * self.res).astype(np.float32)
+        self.mem = np.zeros(self.wall.shape, dtype=np.float32)
+        self.wall_margin, self.decay, self.hit_thresh = wall_margin, decay, hit_thresh
+        self.mem_range, self.depth = mem_range, depth
+
+    @classmethod
+    def from_occupancy_grid(cls, msg, **kw):
+        info = msg.info
+        data = np.asarray(msg.data, dtype=np.int16).reshape(info.height, info.width)
+        return cls((data >= 50) | (data < 0), info.resolution, info.origin.position.x,
+                   info.origin.position.y, **kw)
+
+    def _cells(self, x, y):
+        c = np.floor((x - self.ox) / self.res).astype(np.int32)
+        r = np.floor((y - self.oy) / self.res).astype(np.int32)
+        ok = (r >= 0) & (r < self.wall.shape[0]) & (c >= 0) & (c < self.wall.shape[1])
+        return r, c, ok
+
+    def update(self, ranges, angles, range_min, px, py, yaw, lidar_offset):
+        """one scan, taken at pose (px, py, yaw)"""
+        lx, ly = px + lidar_offset * np.cos(yaw), py + lidar_offset * np.sin(yaw)
+        valid = np.isfinite(ranges) & (ranges > max(range_min, 0.1))
+        self.mem *= self.decay
+        # clear what the beams passed through (every 2nd beam, 0.1 m steps, stop 0.15 m before the return)
+        b = np.arange(0, len(ranges), 2)
+        reach = np.where(valid[b], np.minimum(ranges[b], self.mem_range + 0.5), 0.0)
+        t = np.arange(0.3, self.mem_range + 0.5, 0.1)
+        bi, si = np.nonzero(t[None, :] < reach[:, None] - 0.15)
+        r, c, ok = self._cells(lx + t[si] * np.cos(yaw + angles[b[bi]]), ly + t[si] * np.sin(yaw + angles[b[bi]]))
+        self.mem[r[ok], c[ok]] = 0.0
+        # hits: returns within mem_range that are not part of a map wall
+        h = valid & (ranges < self.mem_range)
+        r, c, ok = self._cells(lx + ranges[h] * np.cos(yaw + angles[h]), ly + ranges[h] * np.sin(yaw + angles[h]))
+        r, c = r[ok], c[ok]
+        keep = self.wall_dist[r, c] > self.wall_margin
+        cells = np.unique(np.c_[r[keep], c[keep]], axis=0)
+        self.mem[cells[:, 0], cells[:, 1]] += 1.0
+
+    def local_grid(self, ranges, angles, range_min, px, py, yaw, lidar_offset, cfg):
+        """same output as scan_to_grid: (dist, ox, oy) around the car, axis-aligned"""
+        n, res = cfg.OBS_CELLS, cfg.OBS_RES
+        half = 0.5 * n * res
+        gx, gy = px - half, py - half
+        ctr = (np.arange(n) + 0.5) * res
+        r = np.floor((gy + ctr - self.oy) / self.res).astype(np.int32)        # map row of each grid row
+        c = np.floor((gx + ctr - self.ox) / self.res).astype(np.int32)        # map column of each grid column
+        ok_r = (r >= 0) & (r < self.wall.shape[0])
+        ok_c = (c >= 0) & (c < self.wall.shape[1])
+        rows = np.clip(r, 0, self.wall.shape[0] - 1)[:, None]
+        cols = np.clip(c, 0, self.wall.shape[1] - 1)[None, :]
+        blocked = self.wall[rows, cols] | (self.mem[rows, cols] >= self.hit_thresh)
+        blocked |= ~(ok_r[:, None] & ok_c[None, :])                           # off the map
+        if len(ranges):
+            lx, ly = px + lidar_offset * np.cos(yaw), py + lidar_offset * np.sin(yaw)
+            hit = np.isfinite(ranges) & (ranges > max(range_min, 0.1)) & (ranges < 1.45 * half)
+            rh, ah = ranges[hit], angles[hit]
+            wx, wy = lx + rh * np.cos(yaw + ah), ly + rh * np.sin(yaw + ah)
+            mr, mc, mok = self._cells(wx, wy)
+            on_wall = np.zeros(len(rh), dtype=bool)
+            on_wall[mok] = self.wall_dist[mr[mok], mc[mok]] <= self.wall_margin
+            # every return blocks its cell; returns off the map walls also the `depth` behind them
+            t = np.arange(0.0, self.depth + 1e-9, res)
+            ext = np.where(on_wall[:, None], 0.0, t[None, :])                 # (B, S)
+            ex = lx + (rh[:, None] + ext) * np.cos(yaw + ah)[:, None]
+            ey = ly + (rh[:, None] + ext) * np.sin(yaw + ah)[:, None]
+            gc = np.floor((ex - gx) / res).astype(np.int32)
+            gr = np.floor((ey - gy) / res).astype(np.int32)
+            k = (gr >= 0) & (gr < n) & (gc >= 0) & (gc < n)
+            blocked[gr[k], gc[k]] = True
+        dist = distance_transform_edt(~blocked) * res
+        return (dist.astype(np.float32), np.float32(gx), np.float32(gy))
+
+
+def detour_offsets(wps, px, py, yaw, v, obs, scan, lidar_offset, cfg, opts, prev_bend=None):
+    """
+    Added: the node's bend_ref without the node (the closed-loop test calls this too). Plans sideways
+    offsets along the next opts['lookahead'] m of the waypoints wps, starting at the car's own offset.
+    :param scan: (ranges, angles) of the newest scan, for the "in front of the return" check
+    :param prev_bend: (first path index, offsets) of the last plan, for opts['consistency']
+    :return: path (M, 4), offsets (M,), index of path[0] in wps, True if the plan is free and drivable
+    """
+    N = len(wps)
+    i0 = int(np.argmin(np.hypot(wps[:, 0] - px, wps[:, 1] - py)))
+    ds = float(np.mean(np.hypot(np.diff(wps[:50, 0]), np.diff(wps[:50, 1]))))
+    M = max(int(opts['lookahead'] / ds), 5)
+    path = wps[(i0 + np.arange(M)) % N]
+    # the car's own sideways offset from the path, so the bent path starts at the car
+    nx, ny = -np.sin(path[0, 2]), np.cos(path[0, 2])
+    start = (px - path[0, 0]) * nx + (py - path[0, 1]) * ny
+    need = cfg.OBS_RADIUS + opts['extra']
+    # finish the detour this far before the obstacle: the distance driven during the delay
+    lead = int(round((max(v, 0.0) * opts['lead_time'] + opts['lead_dist']) / ds))
+    if not opts.get('curvature', False):
+        lx = px + lidar_offset * np.cos(yaw)
+        ly = py + lidar_offset * np.sin(yaw)
+        # with the map prior the grid already knows what is behind the walls: no visibility check
+        view = None if opts.get('map_prior', False) else (scan[0], scan[1], lx, ly, yaw)
+        o_path = plan_lateral_offsets(path, obs, cfg, need=need, scan_view=view, start_offset=start,
+                                      lead=lead, hold_blind=opts['hold_blind'])
+        return path, o_path, i0, True
+    prev = None
+    if prev_bend is not None and opts.get('consistency', 0.0) > 0.0:
+        i_prev, o_prev = prev_bend
+        shift = (i0 - i_prev) % N
+        prev = np.full(M, np.nan)
+        if shift < len(o_prev):
+            k = min(M, len(o_prev) - shift)
+            prev[:k] = o_prev[shift:shift + k]
+    dyaw = np.arctan2(np.sin(yaw - path[0, 2]), np.cos(yaw - path[0, 2]))
+    scale = opts.get('curv_scale', 1.0)
+    o_path, ok = plan_lateral_offsets_curv(
+        path, obs, cfg, need, start_offset=start, start_slope=float(np.tan(np.clip(dyaw, -1.2, 1.2))),
+        kmax_left=scale * np.tan(cfg.MAX_STEER) / cfg.WB, kmax_right=scale * np.tan(-cfg.MIN_STEER) / cfg.WB,
+        station=opts.get('station', 0.5), lead=lead, hold_blind=opts['hold_blind'], prev=prev,
+        w_prev=opts.get('consistency', 0.0))
+    return path, o_path, i0, ok
+
+
+def bend_reference(ref, path, o_path):
+    """Added: move each reference point sideways by the offset at its distance along path"""
+    ds = float(np.mean(np.hypot(np.diff(path[:, 0]), np.diff(path[:, 1]))))
+    # distance of every reference point along the path, measured from path[0]
+    tx, ty = np.cos(path[0, 2]), np.sin(path[0, 2])
+    s0 = (ref[0, 0] - path[0, 0]) * tx + (ref[0, 1] - path[0, 1]) * ty
+    s_ref = s0 + np.r_[0.0, np.cumsum(np.hypot(np.diff(ref[:, 0]), np.diff(ref[:, 1])))]
+    o_ref = np.interp(s_ref, np.arange(len(path)) * ds, o_path)
+    out = np.array(ref, dtype=float)
+    out[:, 0] += o_ref * -np.sin(ref[:, 2])
+    out[:, 1] += o_ref * np.cos(ref[:, 2])
     return out
 
 
@@ -876,6 +1131,24 @@ class MPPI(Node):
         self.declare_parameter('bend_lead_dist', 0.0)  # [m]
         # keep the current detour where no offset is free (unseen space behind an obstacle)
         self.declare_parameter('bend_hold_blind', False)
+        # added: detour planner that knows the car's turning limit (plan_lateral_offsets_curv); False = original
+        self.declare_parameter('bend_curvature', False)
+        self.declare_parameter('bend_curv_scale', 1.0)     # x tan(steering limit) / wheelbase per side
+        self.declare_parameter('bend_station', 0.5)        # [m] between the planned offsets
+        self.declare_parameter('bend_consistency', 0.0)    # weight on |offset - last plan|: no side flipping
+        # reference speed x slow_min_factor while the detour planner finds no free, drivable line
+        self.declare_parameter('bend_fail_slow', False)
+        # added: static map + obstacle memory instead of "unseen = blocked" (MapObstacles)
+        self.declare_parameter('use_map_prior', False)
+        self.declare_parameter('map_topic', '/map')
+        self.declare_parameter('obstacle_depth', 0.3)      # [m] assumed depth behind each obstacle return
+        self.declare_parameter('obstacle_decay', 0.8)      # memory hits x this per scan
+        self.declare_parameter('obstacle_range', 3.0)      # [m] only returns closer than this are remembered
+        self.bend_ok = True
+        self.prev_bend = None    # (index of the first path point, offsets) of the last detour plan
+        self.map_obs = None
+        self.scan_seq = 0        # counts scans, so one scan is added to the memory only once
+        self.mem_seq = -1
         # stuck recovery: back up when standing still for stuck_time s
         # cold start (after a reset) runs this many MPPI iterations at most. Each iteration costs
         # a full control step, so on a slow computer 10 iterations = a long blind gap, and a gap
@@ -910,6 +1183,12 @@ class MPPI(Node):
             self.get_logger().info(f'obstacle avoidance ON: {self.get_parameter("scan_topic").value}, '
                                    f'lidar_offset {self.lidar_offset} m, steer_std {cfg.U_STD[1]}, '
                                    f'obs_radius {cfg.OBS_RADIUS}, obs_margin {cfg.OBS_MARGIN}')
+            if self.get_parameter('use_map_prior').value:
+                # map_server publishes /map once, latched
+                map_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                                     reliability=ReliabilityPolicy.RELIABLE)
+                self.map_sub = self.create_subscription(
+                    OccupancyGrid, self.get_parameter('map_topic').value, self.map_callback, map_qos)
 
         # ---- diagnostics (logging only): where do the ~200 ms on the car come from ----
         # per-segment callback times [s], printed as p50/max with the 2 s log line
@@ -1009,6 +1288,9 @@ class MPPI(Node):
                                            front_free=float(self.get_parameter('slow_front_free').value),
                                            side_stop=float(self.get_parameter('slow_side_stop').value),
                                            side_free=float(self.get_parameter('slow_side_free').value))
+        if scan is not None and not self.bend_ok and self.get_parameter('bend_fail_slow').value:
+            # added: the last detour plan found no free, drivable line -> slow down early
+            f_slow = min(f_slow, float(self.get_parameter('slow_min_factor').value))
         wps = self.waypoints
         t_a = time.perf_counter()
         ref = self.calc_ref_trajectory(x0, wps[:, 0], wps[:, 1], wps[:, 2], wps[:, 3] * f_slow)
@@ -1051,7 +1333,13 @@ class MPPI(Node):
         if scan is not None:
             ranges, angles, range_min = scan
             tg = time.perf_counter()
-            obs = scan_to_grid(ranges, angles, range_min, p.x, p.y, yaw, self.lidar_offset, cfg)
+            if self.map_obs is not None:  # added: map + obstacle memory (use_map_prior)
+                if self.mem_seq != self.scan_seq:
+                    self.map_obs.update(ranges, angles, range_min, p.x, p.y, yaw, self.lidar_offset)
+                    self.mem_seq = self.scan_seq
+                obs = self.map_obs.local_grid(ranges, angles, range_min, p.x, p.y, yaw, self.lidar_offset, cfg)
+            else:
+                obs = scan_to_grid(ranges, angles, range_min, p.x, p.y, yaw, self.lidar_offset, cfg)
             tb = time.perf_counter()
             if self.get_parameter('shift_ref').value:
                 ref = self.bend_ref(np.asarray(ref, dtype=float), p.x, p.y, yaw, obs,
@@ -1170,33 +1458,17 @@ class MPPI(Node):
         starting from the car's own sideways position, and move each reference point by the
         offset at its distance along the path
         """
-        wps = self.waypoints
-        N = len(wps)
-        i0 = int(np.argmin(np.hypot(wps[:, 0] - px, wps[:, 1] - py)))
-        ds = float(np.mean(np.hypot(np.diff(wps[:50, 0]), np.diff(wps[:50, 1]))))
-        M = max(int(float(self.get_parameter('bend_lookahead').value) / ds), 5)
-        path = wps[(i0 + np.arange(M)) % N]
-        # the car's own sideways offset from the path, so the bent path starts at the car
-        nx, ny = -np.sin(path[0, 2]), np.cos(path[0, 2])
-        start = (px - path[0, 0]) * nx + (py - path[0, 1]) * ny
-        lx = px + self.lidar_offset * np.cos(yaw)
-        ly = py + self.lidar_offset * np.sin(yaw)
-        need = cfg.OBS_RADIUS + float(self.get_parameter('bend_extra').value)
-        # finish the detour this far before the obstacle: the distance driven during the delay
-        lead_m = max(v, 0.0) * float(self.get_parameter('bend_lead_time').value) \
-            + float(self.get_parameter('bend_lead_dist').value)
-        o_path = plan_lateral_offsets(path, obs, cfg, need=need,
-                                      scan_view=(scan[0], scan[1], lx, ly, yaw), start_offset=start,
-                                      lead=int(round(lead_m / ds)),
-                                      hold_blind=bool(self.get_parameter('bend_hold_blind').value))
-        # distance of every reference point along the path, measured from path[0]
-        tx, ty = np.cos(path[0, 2]), np.sin(path[0, 2])
-        s0 = (ref[0, 0] - path[0, 0]) * tx + (ref[0, 1] - path[0, 1]) * ty
-        s_ref = s0 + np.r_[0.0, np.cumsum(np.hypot(np.diff(ref[:, 0]), np.diff(ref[:, 1])))]
-        o_ref = np.interp(s_ref, np.arange(M) * ds, o_path)
-        out = np.array(ref, dtype=float)
-        out[:, 0] += o_ref * -np.sin(ref[:, 2])
-        out[:, 1] += o_ref * np.cos(ref[:, 2])
+        gp = lambda k: self.get_parameter(k).value
+        opts = dict(lookahead=float(gp('bend_lookahead')), extra=float(gp('bend_extra')),
+                    lead_time=float(gp('bend_lead_time')), lead_dist=float(gp('bend_lead_dist')),
+                    hold_blind=bool(gp('bend_hold_blind')), curvature=bool(gp('bend_curvature')),
+                    curv_scale=float(gp('bend_curv_scale')), station=float(gp('bend_station')),
+                    consistency=float(gp('bend_consistency')), map_prior=self.map_obs is not None)
+        path, o_path, i0, self.bend_ok = detour_offsets(self.waypoints, px, py, yaw, v, obs,
+                                                        (scan[0], scan[1]), self.lidar_offset, cfg, opts,
+                                                        self.prev_bend)
+        self.prev_bend = (i0, o_path)
+        out = bend_reference(ref, path, o_path)
         self.last_bent_path = np.c_[path[:, 0] - o_path * np.sin(path[:, 2]),
                                     path[:, 1] + o_path * np.cos(path[:, 2])]
         return out
@@ -1212,6 +1484,16 @@ class MPPI(Node):
         ranges = np.asarray(msg.ranges, dtype=np.float64)
         angles = msg.angle_min + msg.angle_increment * np.arange(len(ranges))
         self.scan = (ranges, angles, float(msg.range_min))
+        self.scan_seq += 1
+
+    def map_callback(self, msg):
+        """added (use_map_prior): the static map; from here on the obstacle grid uses MapObstacles"""
+        gp = lambda k: float(self.get_parameter(k).value)
+        self.map_obs = MapObstacles.from_occupancy_grid(msg, depth=gp('obstacle_depth'),
+                                                        decay=gp('obstacle_decay'),
+                                                        mem_range=gp('obstacle_range'))
+        self.get_logger().info(f'map prior: {msg.info.width} x {msg.info.height} cells at '
+                               f'{msg.info.resolution} m, {int(self.map_obs.wall.sum())} wall/unknown')
 
     def speed_callback(self, msg):
         """real car only: forward speed from the VESC odometry"""

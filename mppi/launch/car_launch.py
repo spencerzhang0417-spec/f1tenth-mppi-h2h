@@ -94,6 +94,12 @@ PARAMETERS = {
     'bend_lead_time': 0.35,
     'bend_lead_dist': 0.2,
     'bend_hold_blind': True,
+    # wobble_1103_1647: obstacle on the apex of the bottom-left hairpin (waypoints at ~R 1.07 m, the car's
+    # limit). The old detour planner picked the inside gap without knowing the turning limit and MPPI
+    # hesitated until too late. The curvature-aware planner (closed-loop sim with synthetic scans):
+    # apex obstacle passed 7/8 (old 0/8), no obstacle unchanged; obstacles at the hairpin exit still fail.
+    # use_map_prior / bend_consistency / bend_fail_slow made it worse in the sim: left off
+    'bend_curvature': True,
 }
 
 
