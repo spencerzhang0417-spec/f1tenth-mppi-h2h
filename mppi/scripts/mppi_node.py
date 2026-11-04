@@ -420,7 +420,7 @@ def shift_warm_start(U, Sigma, n, cfg):
 
 
 def scan_to_grid(ranges, angles, range_min, px, py, yaw, lidar_offset, cfg, blind_radius=0.8,
-                 min_valid=0.1):
+                 min_valid=0.1, ahead=0.0):
     """
     Added: LaserScan -> local clearance grid around the car, axis-aligned in the map frame.
     Only cells the scan has actually seen as empty (between the laser and each return) count
@@ -429,18 +429,21 @@ def scan_to_grid(ranges, angles, range_min, px, py, yaw, lidar_offset, cfg, blin
     never seen is not used. Everything within blind_radius of the car is free (unless hit).
     Returns shorter than min_valid are dropped: the car's laser reports ~0.002 m returns off its
     own body, which would put an "obstacle" inside the car and make every sample collide.
+    :param ahead: [m] centre the grid this far in front of the car (added). Centred on the car the
+        8 m grid only reaches 4 m ahead; wobble_1103_2012 saw a corner obstacle 6 m ahead (1.6-1.9 s at
+        3.6-3.9 m/s) but neither the detour nor the slowdown knew about it until it was inside 4 m
     :return: (dist (OBS_CELLS, OBS_CELLS) float32, ox, oy), same layout as obstacle_cost expects.
         numpy, not jnp: every jnp.asarray / jnp.float32 here is its own GPU op (~2-5 ms each on
         the car), while the jitted MPPI step copies numpy arguments to the GPU with the call
     """
     n, res = cfg.OBS_CELLS, cfg.OBS_RES
     half = 0.5 * n * res
-    ox, oy = px - half, py - half
+    ox, oy = px + ahead * np.cos(yaw) - half, py + ahead * np.sin(yaw) - half
     if len(ranges) == 0:  # no scan (e.g. the warm-up compile): everything free
         return (np.full((n, n), 10.0, dtype=np.float32), np.float32(ox), np.float32(oy))
     lx0 = px + lidar_offset * np.cos(yaw)
     ly0 = py + lidar_offset * np.sin(yaw)
-    r_max = 1.45 * half  # far enough to reach the grid corners
+    r_max = 1.45 * half + abs(ahead)  # far enough to reach the grid corners
     valid = np.isfinite(ranges) & (ranges > max(range_min, min_valid))
     hit = valid & (ranges < r_max)
     r_free = np.where(hit, ranges, r_max)
@@ -842,6 +845,41 @@ def bend_reference(ref, path, o_path):
     return out
 
 
+def narrow_gap_ahead(path, o_path, obs, cfg, clearance, start=0.3, max_offset=1.0, step=0.1, blind=0.1):
+    """
+    Added: distance [m] along path to the first point of the planned (bent) path whose clearance in
+    the grid is below `clearance`, or None. Only the part of the path the grid can judge counts: the
+    scan stops at the first point where no sideways offset has even `blind` m of clearance (the unseen
+    space around a corner is all blocked in the grid -- not a narrow gap). Points closer than `start`
+    are where the car already is. wobble_1103_2012: a 0.6 m gap between the inside wall and an
+    obstacle at a corner entry, reached at 2.7-2.8 m/s; the front slowdown only acted 0.4 s before
+    :return: distance or None, the path's clearance (M,)
+    """
+    dist, ox, oy = np.asarray(obs[0]), float(obs[1]), float(obs[2])
+    n = dist.shape[0]
+    M = len(path)
+    ds = float(np.mean(np.hypot(np.diff(path[:, 0]), np.diff(path[:, 1])))) if M > 1 else 0.1
+    nx, ny = -np.sin(path[:, 2]), np.cos(path[:, 2])
+
+    def lookup(px, py):
+        c = np.floor((px - ox) / cfg.OBS_RES).astype(int)
+        r = np.floor((py - oy) / cfg.OBS_RES).astype(int)
+        inside = (r >= 0) & (r < n) & (c >= 0) & (c < n)
+        out = np.full(px.shape, np.nan)
+        out[inside] = dist[r[inside], c[inside]]
+        return out
+
+    clr = lookup(path[:, 0] + o_path * nx, path[:, 1] + o_path * ny)
+    offs = np.arange(-max_offset, max_offset + 1e-9, step)
+    best = np.nanmax(lookup(path[:, 0:1] + offs[None, :] * nx[:, None], path[:, 1:2] + offs[None, :] * ny[:, None]),
+                     axis=1, initial=-1.0)
+    judged = (best >= blind) & np.isfinite(clr)
+    stop = int(np.argmin(judged)) if not judged.all() else M     # first point the grid cannot judge
+    s = np.arange(M) * ds
+    hit = np.where((s[:stop] >= start) & (clr[:stop] < clearance))[0]
+    return (float(s[hit[0]]) if len(hit) else None), clr
+
+
 _simulate_jit = jax.jit(simulate, static_argnames=("cfg",))  # for visualization only
 
 
@@ -1007,6 +1045,10 @@ class MPPI(Node):
         # The simulator's speed controller is proportional (gain ~4.76 when speeding up), so
         # v + a0*DT only gives ~0.7 m/s^2; 0.21 s (= 1/4.76) gives the planned acceleration.
         self.declare_parameter('accel_lead_time', float(MPPIConfig.DT))
+        # added: the same for braking, v + a0 * brake_lead_time (default DT = the original). On the car
+        # (wobble_1103_1910) DT turned a planned -1.2 m/s^2 into a command only 0.06 m/s under the speed:
+        # measured -0.23 m/s^2, so the car could not slow down for the corners
+        self.declare_parameter('brake_lead_time', float(MPPIConfig.DT))
         # added: MPPI weights / sampling as ROS parameters (defaults = MPPIConfig)
         self.declare_parameter('Q', list(MPPIConfig.Q))
         self.declare_parameter('Qf', list(MPPIConfig.Qf))
@@ -1018,10 +1060,16 @@ class MPPI(Node):
         # added: waypoint direction. 'auto' = the track table (levine -> counter-clockwise, the
         # graded direction), 'keep' = as recorded in the csv, 'ccw' / 'cw' = force
         self.declare_parameter('waypoint_direction', 'auto')
+        # added: the curvature speed profile as parameters (defaults = the track table, so the sim and the
+        # autograder are unchanged): v = clip(sqrt(a_lat / |kappa|), v_min, v_max), accel / brake <= a_lon,
+        # then x speed_scale (so with speed_scale 1 these are what the car gets) [m/s, m/s^2]
+        opts = dict(WAYPOINTS.get(track, WAYPOINTS['levine']))
+        for k in ('v_min', 'v_max', 'a_lat', 'a_lon'):
+            self.declare_parameter(k, float(opts[k]))
+            opts[k] = float(self.get_parameter(k).value)
 
         # ---- waypoints ----
         wp_dir = os.path.join(get_package_share_directory('mppi'), 'waypoints')
-        opts = dict(WAYPOINTS.get(track, WAYPOINTS['levine']))
         direction = str(self.get_parameter('waypoint_direction').value).lower()
         if direction in ('keep', 'ccw', 'cw'):
             opts['ccw'] = {'keep': None, 'ccw': True, 'cw': False}[direction]
@@ -1138,6 +1186,15 @@ class MPPI(Node):
         self.declare_parameter('bend_consistency', 0.0)    # weight on |offset - last plan|: no side flipping
         # reference speed x slow_min_factor while the detour planner finds no free, drivable line
         self.declare_parameter('bend_fail_slow', False)
+        # added: centre the obstacle grid this far ahead of the car [m] (see scan_to_grid)
+        self.declare_parameter('grid_ahead', 0.0)
+        # added: brake for a narrow gap on the planned path ahead (narrow_gap_ahead): reference speed
+        # <= sqrt(narrow_speed^2 + 2 narrow_decel (d - v latency)) with d the distance to the first point
+        # of the bent path with < narrow_clearance [m] clearance. 0 = off
+        self.declare_parameter('narrow_clearance', 0.0)
+        self.declare_parameter('narrow_speed', 1.5)   # [m/s] at the narrow point
+        self.declare_parameter('narrow_decel', 2.0)   # [m/s^2]
+        self.narrow_d = None     # distance to the narrow point found by the last detour plan
         # added: static map + obstacle memory instead of "unseen = blocked" (MapObstacles)
         self.declare_parameter('use_map_prior', False)
         self.declare_parameter('map_topic', '/map')
@@ -1291,6 +1348,14 @@ class MPPI(Node):
         if scan is not None and not self.bend_ok and self.get_parameter('bend_fail_slow').value:
             # added: the last detour plan found no free, drivable line -> slow down early
             f_slow = min(f_slow, float(self.get_parameter('slow_min_factor').value))
+        if scan is not None and self.narrow_d is not None:
+            # added: narrow gap ahead on the last detour plan -> brake in time to reach it at narrow_speed
+            lat_s = max(float(self.get_parameter('latency_comp').value), 0.0)
+            d = self.narrow_d - max(v, 0.0) * (lat_s + cfg.DT)   # the plan is one step old
+            v_cap = np.sqrt(float(self.get_parameter('narrow_speed').value) ** 2
+                            + 2.0 * float(self.get_parameter('narrow_decel').value) * max(d, 0.0))
+            i_car = int(np.argmin(np.hypot(self.waypoints[:, 0] - p.x, self.waypoints[:, 1] - p.y)))
+            f_slow = min(f_slow, v_cap / max(float(self.waypoints[i_car, 3]), 0.1))
         wps = self.waypoints
         t_a = time.perf_counter()
         ref = self.calc_ref_trajectory(x0, wps[:, 0], wps[:, 1], wps[:, 2], wps[:, 3] * f_slow)
@@ -1339,7 +1404,8 @@ class MPPI(Node):
                     self.mem_seq = self.scan_seq
                 obs = self.map_obs.local_grid(ranges, angles, range_min, p.x, p.y, yaw, self.lidar_offset, cfg)
             else:
-                obs = scan_to_grid(ranges, angles, range_min, p.x, p.y, yaw, self.lidar_offset, cfg)
+                obs = scan_to_grid(ranges, angles, range_min, p.x, p.y, yaw, self.lidar_offset, cfg,
+                                   ahead=float(self.get_parameter('grid_ahead').value))
             tb = time.perf_counter()
             if self.get_parameter('shift_ref').value:
                 ref = self.bend_ref(np.asarray(ref, dtype=float), p.x, p.y, yaw, obs,
@@ -1384,7 +1450,7 @@ class MPPI(Node):
         drive.header.stamp = self.get_clock().now().to_msg()
         drive.header.frame_id = 'ego_racecar/base_link' if self.use_sim else 'base_link'
         drive.drive.steering_angle = delta0
-        lead = float(self.get_parameter('accel_lead_time').value) if a0 > 0.0 else cfg.DT
+        lead = float(self.get_parameter('accel_lead_time' if a0 > 0.0 else 'brake_lead_time').value)
         drive.drive.speed = float(np.clip(v + a0 * lead, cfg.MIN_SPEED, cfg.MAX_SPEED))
         # added: stuck recovery. MPPI only drives forward, so in a spot where every forward
         # trajectory collides (e.g. pointing at an obstacle in a tight turn) it just stops.
@@ -1468,6 +1534,8 @@ class MPPI(Node):
                                                         (scan[0], scan[1]), self.lidar_offset, cfg, opts,
                                                         self.prev_bend)
         self.prev_bend = (i0, o_path)
+        clearance = float(gp('narrow_clearance'))
+        self.narrow_d = narrow_gap_ahead(path, o_path, obs, cfg, clearance)[0] if clearance > 0.0 else None
         out = bend_reference(ref, path, o_path)
         self.last_bent_path = np.c_[path[:, 0] - o_path * np.sin(path[:, 2]),
                                     path[:, 1] + o_path * np.cos(path[:, 2])]
