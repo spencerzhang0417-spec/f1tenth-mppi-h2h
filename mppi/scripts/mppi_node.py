@@ -343,7 +343,7 @@ def opponent_cost(X, opp, cfg):
     """
     Added (head-to-head): per-step cost of one trajectory against moving cars, shape (H,)
     :param X: states x_0 ... x_H, shape (H+1, NX)
-    :param opp: predicted opponent poses [x, y, yaw] at the same H+1 times, shape (OPP_MAX, H+1, 3);
+    :param opp: predicted opponent poses [x, y, yaw, soft margin] at the same H+1 times, shape (OPP_MAX, H+1, 4);
                 unused rows are far away. Unlike the scan grid this is time-indexed: where the
                 other car WILL be when the ego gets there, not where it is now
     """
@@ -355,9 +355,13 @@ def opponent_cost(X, opp, cfg):
     oy = opp[:, 1:, 1:2] + jnp.sin(opp[:, 1:, 2:3]) * off_o
     d = jnp.sqrt((ex[None, :, :, None] - ox[:, :, None, :]) ** 2
                  + (ey[None, :, :, None] - oy[:, :, None, :]) ** 2 + 1e-9)  # (K, H, Ke, Ko)
-    d = jnp.min(d, axis=(0, 2, 3))                                     # closest pair per step
-    return cfg.OPP_HARD * (d < cfg.OPP_RADIUS) \
-        + cfg.OPP_SOFT * jnp.maximum(cfg.OPP_MARGIN - d, 0.0) ** 2
+    d = jnp.min(d, axis=(2, 3))                                        # (K, H) closest pair per car and step
+    # The soft margin comes with each car (opp[..., 3]), not from cfg: next to the car it is
+    # passing the ego has to be closer than it should come to any other car. With 0.65 m for
+    # all, MPPI held back diagonally behind a car it was 0.6 m beside instead of driving past
+    # (the soft cost there is as large as the cost of being 0.5 m/s too slow).
+    return cfg.OPP_HARD * jnp.any(d < cfg.OPP_RADIUS, axis=0) \
+        + cfg.OPP_SOFT * jnp.max(jnp.maximum(opp[:, 1:, 3] - d, 0.0) ** 2, axis=0)
 
 
 def _lambda_for_ess(S_n, target, n_iter=16):
@@ -1305,6 +1309,17 @@ class MPPI(Node):
         # (2.1 m), which is what the 0.3 s of delay on the real car needs: raise it again there
         self.declare_parameter('h2h_follow_gap', 0.3)
         self.declare_parameter('h2h_follow_time', 0.2)
+        # how early the ego brakes behind a car: the deceleration it counts on [m/s^2] and its
+        # reaction time [s] (pose age + control step + actuation). The defaults are for the car's
+        # 0.3 s of delay; without delay they keep the ego 3 m behind a car of its own speed
+        self.declare_parameter('h2h_follow_decel', 1.0)
+        self.declare_parameter('h2h_pass_margin', 0.5)   # [m] soft margin to the car being passed
+        # > 0: corners are judged by the speed driven there (side by side behind slow cars, moving
+        # up on the inside into a corner), e.g. 0.7 = 70 % of the grip. Off: it crashed in tests
+        self.declare_parameter('h2h_grip_use', 0.0)
+        self.declare_parameter('h2h_pass_wait', 3.0)     # [m] a pass may start this far before its room opens
+        self.declare_parameter('h2h_standing_cars', True)  # tracked objects that stand still count as car bodies
+        self.declare_parameter('h2h_react_time', 0.35)
         # the laser sees a car's rear box (12 x 12 x 20 cm, required on every car): True = a cluster
         # is that box, the car's center 0.23 m ahead of it; False = a cluster is the car's body
         self.declare_parameter('h2h_box', True)
@@ -1377,18 +1392,23 @@ class MPPI(Node):
                                              pass_kappa=float(gp('h2h_pass_kappa')),
                                              min_dv=float(gp('h2h_min_dv')) if gp('h2h_pass') else 1e9,
                                              follow_gap=float(gp('h2h_follow_gap')),
-                                             follow_time=float(gp('h2h_follow_time')))
+                                             follow_time=float(gp('h2h_follow_time')),
+                                             follow_decel=float(gp('h2h_follow_decel')), a_lat=float(opts['a_lat']),
+                                             grip_use=float(gp('h2h_grip_use')), pass_wait=float(gp('h2h_pass_wait')),
+                                             react_time=float(gp('h2h_react_time')))
             self.h2h_seq = -1       # scan the tracker was last updated with
             self.h2h_t = None       # its time
             self.h2h_pose_lag = float(gp('h2h_pose_lag'))
-            self.h2h_far = h2h_lib.predict_opponents(self.h2h_frame, [], np.zeros(cfg.H + 1), cfg.OPP_MAX)
+            self.h2h_far = h2h_lib.predict_opponents(self.h2h_frame, [], np.zeros(cfg.H + 1), cfg.OPP_MAX,
+                                                             margin=cfg.OPP_MARGIN)
             self.h2h_pub_t = 0.0
             self.h2h_marker_pub = self.create_publisher(MarkerArray, '/h2h/markers', 1)
             self.h2h_track_pub = self.create_publisher(Odometry, '/h2h/opp_track', 1)  # nearest car
             self.h2h = True
             if gp('h2h_log'):
                 self.h2h_log = open(gp('h2h_log'), 'w')
-                self.h2h_log.write('t,state,side,s_e,d_e,v_e,gap,d_opp,v_opp,v_cap,d_pass,n_moving,a_cmd,steer_cmd,dt_trk\n')
+                self.h2h_log.write('t,state,side,s_e,d_e,v_e,gap,d_opp,v_opp,v_cap,d_pass,n_moving,a_cmd,steer_cmd,dt_trk,'
+                                   'f_slow,v_ref0,v_refH\n')
             self.get_logger().info(f'head-to-head ON: waiting for {gp("h2h_map_topic")}; '
                                    f'pass {"on" if gp("h2h_pass") else "off"}, '
                                    f'opp radius {cfg.OPP_RADIUS} / margin {cfg.OPP_MARGIN} m')
@@ -1517,16 +1537,20 @@ class MPPI(Node):
             # added: narrow gap ahead on the last detour plan -> brake in time to reach it at narrow_speed
             lat_s = max(float(self.get_parameter('latency_comp').value), 0.0)
             d = self.narrow_d - max(v, 0.0) * (lat_s + cfg.DT)   # the plan is one step old
-            v_cap = np.sqrt(float(self.get_parameter('narrow_speed').value) ** 2
-                            + 2.0 * float(self.get_parameter('narrow_decel').value) * max(d, 0.0))
+            # (its own name: as `v_cap` this replaced the head-to-head follow cap whenever a narrow
+            # gap was in sight, and the car accelerated at full throttle 1.4 m/s over the cap into
+            # the hairpin behind a 0.7x car and hit it)
+            v_narrow = np.sqrt(float(self.get_parameter('narrow_speed').value) ** 2
+                               + 2.0 * float(self.get_parameter('narrow_decel').value) * max(d, 0.0))
             i_car = int(np.argmin(np.hypot(self.waypoints[:, 0] - p.x, self.waypoints[:, 1] - p.y)))
-            f_slow = min(f_slow, v_cap / max(float(self.waypoints[i_car, 3]), 0.1))
+            f_slow = min(f_slow, v_narrow / max(float(self.waypoints[i_car, 3]), 0.1))
         wps = self.waypoints if wps_h2h is None else wps_h2h  # PASS: the line next to the opponent
         t_a = time.perf_counter()
         # v_cap (following a car) is a speed, not a factor: a factor taken at the car's own waypoint
         # still lets the reference speed up further ahead, where the profile is faster
         ref = self.calc_ref_trajectory(x0, wps[:, 0], wps[:, 1], wps[:, 2],
                                        np.minimum(wps[:, 3] * f_slow, v_cap))
+        self.h2h_dbg = (f_slow, float(np.asarray(ref)[1, 3]), float(np.asarray(ref)[-1, 3]))  # for the h2h log
         t_b = time.perf_counter()
 
         # TODO: warm start: the first input of self.U was applied at the last
@@ -1739,8 +1763,15 @@ class MPPI(Node):
                  (None = the raceline, else the raceline shifted next to the car being passed)
         """
         cfg, frame, tac = self.config, self.h2h_frame, self.h2h_tac
-        if frame.wall_dist is None:  # no map yet: cannot tell cars from walls
-            return scan, None, np.inf, None
+        if frame.wall_dist is None:
+            # No map yet: cannot tell cars from walls, so no car is followed or avoided as one.
+            # Wait for it. (The simulator's map once came 3 s after the start: the ego was at
+            # 3.8 m/s when the car ahead first showed up, 0.6 m in front, and touched it.)
+            now = time.monotonic()
+            if now - getattr(self, 'h2h_warn_t', 0.0) > 2.0:
+                self.h2h_warn_t = now
+                self.get_logger().warn(f'head-to-head: no map on {self.get_parameter("h2h_map_topic").value} yet, holding')
+            return scan, None, 0.0, None
         ranges, angles, range_min = scan
         lx, ly = px + self.lidar_offset * np.cos(yaw), py + self.lidar_offset * np.sin(yaw)
         t_now = t_pose - self.h2h_pose_lag   # the time this pose is really from
@@ -1783,8 +1814,24 @@ class MPPI(Node):
             # car to leave room. Predict it staying where it is (not closing the door) and a bit
             # further away, so MPPI does not brake for a squeeze that is the other car's to avoid.
             # Real contact (the hard cost at OPP_RADIUS) still counts.
-            hold = {id(tac.target): -tac.side * float(self.get_parameter('h2h_claim_room').value)}
-        opp = h2h_lib.predict_opponents(frame, moving, t_ahead, cfg.OPP_MAX, hold=hold)
+            # (further away only once the ego's nose is in front: next to a car that is still
+            # ahead, the ego keeps the true distance)
+            hold = {id(tac.target): -tac.side * (float(self.get_parameter('h2h_claim_room').value)
+                                                 if tac.claim_ahead else 0.0)}
+        close = None
+        if tac.state == tac.PASS and tac.target is not None:
+            close = {id(tac.target): min(float(self.get_parameter('h2h_pass_margin').value), cfg.OPP_MARGIN)}
+        # Cars that stand still get their body in the cost too (nearest first, after the moving
+        # ones). In the scan a car is only its rear box: the static obstacle code steers around a
+        # 12 cm box, and scraped along the 58 x 31 cm car in front of it (an opponent that was
+        # late off the start line, twice).
+        cars = moving
+        if self.get_parameter('h2h_standing_cars').value:
+            standing = sorted((tr for tr in tracks if not tr.moving and np.hypot(tr.c[0] - cx, tr.c[1] - cy) < 6.0),
+                              key=lambda tr: np.hypot(tr.c[0] - cx, tr.c[1] - cy))
+            cars = (moving + standing)[:cfg.OPP_MAX]
+        opp = h2h_lib.predict_opponents(frame, cars, t_ahead, cfg.OPP_MAX, hold=hold,
+                                        margin=cfg.OPP_MARGIN, margins=close)
         wps = None
         if tac.state == tac.SWITCHBACK:
             wps = self.h2h_attack_wps   # index-aligned with the raceline: just another line
@@ -1795,9 +1842,10 @@ class MPPI(Node):
             o = tac.ref_offsets(s_wp, np.maximum(ahead, 0.0) / max(v, 1.0))
             # leave the ego's own sideways position at 0.2 m per m at most: a line that jumps
             # sideways under the car makes MPPI brake instead of steer (and 0.35 m per m at
-            # 3.5 m/s is 1.2 m/s sideways, more than the tires hold while accelerating)
-            lim = abs(d_e) + 0.1 + 0.2 * np.maximum(ahead, 0.0)
-            o = np.clip(o, -lim, lim)
+            # 3.5 m/s is 1.2 m/s sideways, more than the tires hold while accelerating).
+            # Measured from where the car is (not from the raceline), so a line that changes
+            # sides crosses over at the same rate; then inside the track again at every station.
+            o = tac.shape(o, s_e, d_e)
             wps = self.waypoints.copy()
             wps[:, 0] -= o * np.sin(wps[:, 2])
             wps[:, 1] += o * np.cos(wps[:, 2])
@@ -1809,12 +1857,17 @@ class MPPI(Node):
             # Back from a pass / switchback line, the ego is still up to half a meter beside the
             # raceline. Do not snap the reference back under it (that swung the car across the
             # track): start the reference where the car is and bring it in over a few meters.
-            if abs(d_e) < 0.12:
+            if abs(d_e) < 0.12 and tac.hold is None:
                 self.h2h_merge = False
             else:
                 ahead = frame.wrap(np.arange(frame.n) * frame.ds - s_e)
                 length = max(4.0, 1.5 * v)
-                o = d_e * (1.0 - h2h_lib._smoothstep(np.clip(ahead, 0.0, None) / length)) * (ahead > -1.0) * (ahead < length)
+                # tac.hold: dropping back next to a car after a pass that was given up. Stay on
+                # this side until behind it; merging at once steers into its tail.
+                hold = tac.hold or 0.0
+                o = d_e * (1.0 - h2h_lib._smoothstep(np.clip(ahead - hold, 0.0, None) / length)) \
+                    * (ahead > -1.0) * (ahead < length + hold)
+                o = tac.clamp(o)
                 wps = self.waypoints.copy()
                 wps[:, 0] -= o * np.sin(wps[:, 2])
                 wps[:, 1] += o * np.cos(wps[:, 2])
@@ -1831,7 +1884,8 @@ class MPPI(Node):
             self.h2h_log.write(
                 f'{t_pose:.3f},{tac.state},{tac.side},{s_e:.2f},{d_e:.2f},{v:.2f},{tac.gap:.2f},'
                 f'{tr.d if tr else np.nan:.2f},{tr.vs if tr else np.nan:.2f},{tac.v_cap:.2f},'
-                f'{tac.d_pass:.2f},{len(moving)},{self.last_cmd[0]:.2f},{self.last_cmd[1]:.3f},{dt_trk:.3f}\n')
+                f'{tac.d_pass:.2f},{len(moving)},{self.last_cmd[0]:.2f},{self.last_cmd[1]:.3f},{dt_trk:.3f},'
+                + '{:.2f},{:.2f},{:.2f}\n'.format(*getattr(self, 'h2h_dbg', (1.0, 0.0, 0.0))))  # of the last step
         now = time.monotonic()
         if now - self.h2h_pub_t > 0.05:  # 20 Hz: markers for the viewer, the nearest car as odometry
             self.h2h_pub_t = now

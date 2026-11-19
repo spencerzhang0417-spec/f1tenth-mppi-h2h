@@ -141,6 +141,9 @@ def _setup(context):
         if LaunchConfiguration('pace').perform(context) == 'race':
             ego.update(RACE_PACE)
         ego.update(DELAYED_TOPICS if latency else NO_LATENCY)
+        if not latency:
+            # nothing between a command and its effect: the ego can sit closer behind a car
+            ego.update({'h2h_follow_decel': 2.0, 'h2h_react_time': 0.1, 'h2h_follow_time': 0.1})
         ego['h2h'] = h2h
         ego['h2h_pass'] = LaunchConfiguration('h2h_pass').perform(context).lower() == 'true'
         ego['h2h_log'] = LaunchConfiguration('h2h_log').perform(context)
