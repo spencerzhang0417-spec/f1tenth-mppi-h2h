@@ -1,287 +1,212 @@
-# Lab 8: Model Predictive Path Integral Control
-
-## I. Learning Goals
-
-- Discretization: Forward Euler and Runge-Kutta 4
-- Model Predictive Path Integral (MPPI) Control
-
-## II. Vehicle Dynamics
-
-### a. State and Dynamics Model
-
-We use the same kinematic model as in the MPC lab. The state is $x=[p_x, p_y, \theta, v]$, and the input vector is $u=[a, \delta]$ where $a$ is acceleration and $\delta$ is steering angle. The kinematic model ODEs are:
-
-$$
-\dot{p_x}=v\cos(\theta)
-$$
-
-$$
-\dot{p_y}=v\sin(\theta)
-$$
-
-$$
-\dot{\theta}=\frac{v\tan(\delta)}{L}
-$$
-
-$$
-\dot{v}=a
-$$
-
-Where $L$ is the wheelbase of the vehicle. We can then represent the dynamics of the vehicle as:
-
-$$
-\dot{x}=f(x, u)
-$$
-
-In the MPC lab you linearized $f$ around a reference to turn the problem into a Quadratic Program. MPPI does not need to linearize since it only needs to simulate the dynamics $f$, so you can use the nonlinear model as is.
-
-### b. Discretization
-
-MPPI is still a discrete-time controller which works in discrete steps of $\Delta t$. As such, we need to discretize the dynamics $f$ into a function $F$ that takes the current state and input and returns the next state after $\Delta t$. We will use sample-and-hold to discretize the dynamics, where we assume the input is held constant over $\Delta t$. There are multiple ways to discretize nonlinear dynamics which we will cover next.
-
-#### i. Forward Euler
-
-The simplest discretization you can use is Forward Euler. It is a first-order method that approximates the next state by taking a step along the derivative at the current state. Forward Euler assumes the derivative stays constant over $\Delta t$:
-
-$$
-x_{k+1} = x_k + f(x_k, u_k)\,dt
-$$
-
-This is cheap because you only need one evaluation of $f$ per step, but it is also only first-order accurate: the error grows linearly with $\Delta t$. At high speeds (i.e > 5 m/s) and large $\Delta t$ (e.g. 0.1 s), the error can be significant. Smaller $\Delta t$ can help, but this would require more steps to cover the same seconds in your horizon, which increases the computation time.
-
-#### ii. Runge-Kutta 4 (Bonus)
-
-A better discretization for nonlinear dynamics is Runge-Kutta 4 (RK4). It is a fourth-order method that evaluates the derivative at multiple points in the interval and combines them to get a better estimate of the next state. The RK4 update is:
-
-$$
-k_1 = f(x_k, u_k)
-$$
-
-$$
-k_2 = f\left(x_k + \tfrac{dt}{2} k_1,\, u_k\right)
-$$
-
-$$
-k_3 = f\left(x_k + \tfrac{dt}{2} k_2,\, u_k\right)
-$$
-
-$$
-k_4 = f\left(x_k + dt\, k_3,\, u_k\right)
-$$
-
-$$
-x_{k+1} = x_k + \frac{dt}{6}\left(k_1 + 2k_2 + 2k_3 + k_4\right)
-$$
-
-RK4 is fourth-order accurate: halving $\Delta t$ cuts the error by about $16\times$, against $2\times$ for Euler. Each step costs four evaluations of $f$, but RK4 stays accurate at a larger $\Delta t$, so it can be faster overall.
-
-**Bonus:** Implement RK4 as an alternative to Euler integration in your MPPI implementation and add a parameter to switch between the two. Report the difference between the two methods in `SUBMISSION.md` by rolling out the same control sequence (i.e max steering at 5 m/s for 1 s) using Euler and RK4 at your chosen $\Delta t$, and compare with Euler with a smaller $\Delta t$, and plot the three paths. Comment on the difference between the two, which one you chose, and why.
-
-## III. Recap: the MPC problem
-
-Before starting the lab, make sure you understand the MPC formulation from the previous lab and the MPPI algorithm from the lecture. We'll briefly go over both here. You'll have MPPI solve the same problem as MPC: generate valid control inputs for $H$ steps ahead that control the vehicle and follow the reference trajectory as closely as possible. What changes is *how* the problem is solved.
-
-### a. Objective Function
-
-We'll use the same objective from the MPC lab. We want to minimize:
-1. Deviation of the vehicle from the reference trajectory. The final state deviation is weighted by $Q_f$, and other state deviations are weighted by $Q$.
-2. Influence of the control inputs. Weighted by $R$.
-3. Difference between one control input and the next control input. Weighted by $R_d$.
-
-$$
-J = \left(x_{H}-x_{H, ref}\right)^{\top} Q_{f}\left(x_{H}-x_{H, ref}\right)+\sum_{t=0}^{H-1}\left(x_{t}-x_{t, ref}\right)^{\top} Q\left(x_{t}-x_{t, ref}\right)+\sum_{t=0}^{H-1} u_{t}^{\top} R\, u_{t}+\sum_{t=0}^{H-2}\left(u_{t+1}-u_{t}\right)^{\top} R_{d}\left(u_{t+1}-u_{t}\right)
-$$
-
-Because MPPI only evaluates the cost, it does not need to be quadratic, convex or even differentiable. You are free to make your own custom cost function, such as a large penalty for going beyond the track bounds or similar.
-
-Note that you will need to handle heading error wrap-around when computing the cost. For example, if the reference heading is 179° and the vehicle heading is -179°, the heading error is 2°, not 358°. You can achieve this either by wrapping the heading error to [-180°, 180°] or by squaring the angular distance $\Delta \theta = \text{atan2}(\sin(\alpha - \beta), \cos(\alpha - \beta))$
-
-### b. Constraints
-
-The controller needs to satisfy the same constraints as in the MPC lab. The constraints include:
-1. Future vehicle states must follow the vehicle's dynamic model.
-   $$\dot{x_t}=f(x_t, u_t)$$
-2. Initial state in the plan for the current horizon must match current vehicle state.
-   $$x_{0}=x_{\text{curr}}$$
-3. Inputs generated must be within vehicle limits.
-   $$a_{\text{min}} \leq a \leq a_{\text{max}}$$
-   $$\delta_{\text{min}} \leq \delta \leq \delta_{\text{max}}$$
-
-Because you can not enforce constraints with a solver for MPPI, we can enforce them by construction:
-
-1. **Future vehicle states must follow the vehicle dynamics model.** MPPI simulates the vehicle dynamics to generate future states, so every rollout obeys the dynamics by construction:
-   $$x_{k+1}=F(x_k, u_k)$$
-   where $F$ is the discretized dynamics of Section II.
-2. **The initial state in the plan must match the current vehicle state.** Every rollout starts from the current vehicle state, so the first state in every rollout is the current state:
-   $$x_{0}=x_{\text{curr}}$$
-3. **Inputs generated must be within vehicle limits.** Clip every sampled input to the bounds:
-   $$a_{\text{min}} \leq a \leq a_{\text{max}}$$
-   $$\delta_{\text{min}} \leq \delta \leq \delta_{\text{max}}$$
-
-   **Bonus:** Use a truncated sampling distribution instead of clipping to avoid sampling outside the bounds. For example, if the acceleration is limited to [-1, 1], you can sample from a truncated normal distribution with mean 0 and standard deviation 0.5, truncated to [-1, 1]. Experiment with different truncated sampling distributions like uniform, beta, etc. and report your findings in `SUBMISSION.md`.
-
-
-For the rest of the constraints (e.g max speed, staying on the track), we will leave it as an exercise for you to come up with a way to enforce them. The simplest way is to add a large penalty to the cost function for violating the constraints. Feel free to experiment with different ways to enforce constraints and report your findings in `SUBMISSION.md`.
-
-## IV. The MPPI Algorithm
-
-MPPI approximates a solution to the following stochastic finite-time optimal control problem (FTOCP):
-
-$$
-\begin{aligned}
-& \underset{u_0, \ldots, u_{H-1}}{\text{minimize}}
-& & \mathbb{E}\left[J\left(x_{0}, u_0, \ldots, u_{H-1}\right)\right] \\
-& \text{subject to}
-& & x_{k+1}=F\left(x_k, u_k\right), \quad k=0, \ldots, H-1 \\
-& & & x_0=x_{\text{curr}} \\
-& & & u_t \in \mathcal{U} \subseteq \mathbb{R}^{m}, \quad k=0, \ldots, H-1
-\end{aligned}
-$$
-
-The expectation is approximated via Monte Carlo sampling. MPPI *samples* many control sequences from a proposal control distribution $\mathbb{Q}_{U,\Sigma}$, simulates the resulting trajectories, and computes the cost of each trajectory. Then, the KL-divergence between the proposal distribution and the optimal distribution $\mathbb{Q}^*$ is minimized using importance sampling. The resulting update is a weighted average of the sampled control sequences, where the weights are computed from the cost of each trajectory and vary per timestep.
-
-Each timestep, starting from the current state $x_{\text{curr}}$, the MPPI algorithm performs the following steps:
-
-1. **Sample** $T$ control sequences of length $H$ from the proposal distribution $\mathbb{Q}_{U,\Sigma}$, where $T$ is the number of samples, $H$ is the horizon, $U$ is the mean of the proposal distribution, and $\Sigma$ is the covariance of the proposal distribution. Use a Gaussian with mean $U$ and covariance $\Sigma$, clipped to the input bounds (see Section III.b).
-2. **Simulate** each control sequence using the discretized dynamics $F$ to generate a trajectory of states.
-3. **Score** each trajectory using the cost function $J$. Since the weights vary per timestep, we score each timestep $t$ of trajectory $k$ with its cost-to-go $S_t^k$: the cost of trajectory $k$ from timestep $t$ to the end of the horizon.
-4. **Weight** each trajectory at each timestep from its cost-to-go and the temperature parameter $\lambda$ using importance sampling. So that $\lambda$ does not depend on the scale of your cost, first normalize the costs-to-go of each timestep to $[0, 1]$:
-$$
-\tilde{S}_t^k = \frac{S_t^k - \min_j S_t^j}{\max_j S_t^j - \min_j S_t^j}
-$$
-   The weight of trajectory $k$ at timestep $t$ is then given by:
-$$
-w_t^k = \frac{\exp\left(-\frac{1}{\lambda} \tilde{S}_t^k\right)}{\sum_{j=1}^{T} \exp\left(-\frac{1}{\lambda} \tilde{S}_t^j\right)}
-$$
-5. **Update** the mean of the proposal distribution $U$ using the weighted average of the sampled control sequences, at each timestep:
-$$
-U_t = \sum_{k=1}^{T} w_t^k u_t^k
-$$
-   **Bonus** You can also update the covariance of the proposal distribution $\Sigma$ using the weighted covariance of the sampled control sequences:
-$$
-\Sigma_t = \sum_{k=1}^{T} w_t^k (u_t^k - U_t)(u_t^k - U_t)^\top
-$$
-6. **Apply** $U_0$ to the car, then shift $U$ one timestep forward to warm start the next iteration, and repeat the process at the next timestep.
-
-### Parameters to tune
-
-- **$T$, the number of samples.** More samples give a better approximation of the expectation, but take longer to compute. Fewer samples are faster, but may not find a better control sequence.
-- **$H$, the horizon.** The number of timesteps to look ahead.
-- **$\Delta t$, the time step.** The time between each control update.
-- **$\Sigma$** The covariance of the proposal distribution. It sets how much exploration is done in the control space. A larger $\Sigma$ means more exploration, but also more noise in the control sequence.
-- **$\lambda$, the temperature.** It sets how greedy the average is. As $\lambda \to 0$ the update takes only the best sample and the control gets noisy; as $\lambda$ increases, the weighting becomes more uniform. A useful check is the effective sample size, $1 / \sum_k (w_t^k)^2$: if it is close to $1$, $\lambda$ is too small; if it is close to $T$, it is too large.
-- **$Q$, $Q_f$, $R$, $R_d$, the cost weights,** as in the MPC lab.
-
-### Vectorize the rollouts
-
-Simulating $T \times H$ calls to $F$ every timestep would take too long to compute if done sequentially using a for loop. Instead, you will need to vectorize the rollouts. Break down the simulation into three functions: a `step` function that takes in a state and a control input and returns the next state, a `simulate` function that takes in an initial state and a sequence of control inputs and returns the resulting trajectory of states, and a `rollout` function that takes in an initial state and a batch of control sequences and returns the resulting batch of trajectories. The `rollout` function should be vectorized over the $T$ samples, so that it can simulate all $T$ trajectories in parallel.
- 
-## V. Reference Trajectory
-
-You can reuse the waypoints you made in the MPC lab as your reference trajectory. We recall the instructions here for convenience. 
-   
-> You'll need to create a reference trajectory that has velocity attached to each waypoint that you create. (You can follow instructions from the Pure Pursuit lab to create waypoints). For a smooth velocity profile, you can use the curvature information on the waypoint spline you've created to interpolate between a maximum and a minimum velocity. Make sure the reference has the same states as the vehicle model you've set up in the optimization problem. Please refer to the Pure Pursuit lab for instructions and hints on how to log and visualize waypoints.
-
-## VI. Implementing MPPI
-
-The skeleton is in `mppi/scripts/mppi_node.py`. You can find missing parts in the code by searching for `TODO` tags. Your tasks are:
-
-1. **Dynamics.** Fill in `dynamics()` with the kinematic model $f(x, u)$, and `step_euler()` with the Euler step $F$, both for a single state (`rollout()` vectorizes them over the $T$ samples). The bonus is `step_rk4()`.
-2. **Rollouts and cost.** Fill in `simulate()`, which simulates one control sequence from the current state, `rollout()`, which simulates all $T$ sampled sequences in parallel, and `cost()`, which scores each timestep of a trajectory with the objective of Section III.a.
-3. **MPPI update.** Fill in `mppi_step()` with steps 1 to 5 of Section IV.
-4. **Callback.** Create your subscribers and publishers and load your waypoints in `__init__()`, then fill in `odom_callback()`: read the vehicle state, compute the reference for the next $H$ steps, warm start $U$, run `mppi_step()` and publish the first input as an `AckermannDriveStamped`, with speed $v + a_0\,dt$ and steering $\delta_0$.
-
-**Dependencies.** The skeleton only needs JAX (`pip install jax`); there is no solver to install.
-
-## VII. Visualization
-
-It is very helpful to visualize, on top of the current segment of the reference path:
-- a subset of the sampled rollouts (say 50), colored by their weight, to see where MPPI is searching;
-   **WARNING:** This is very expensive to compute and render, especially on the real car, so only do it for debugging and not in your final submission.
-- the trajectory of the updated nominal sequence, to see what the car plans to do.
-
-## VIII. Testing your code for Autograder
-
-You can test out your node in the [f1tenth_gym_ros](https://github.com/f1tenth/f1tenth_gym_ros/tree/dev-jazzy) simulator on the **two tracks** that we will use in the autograder. To do so, you can set the map in `config/sim.yaml` accordingly:
-
-| Track | `map_path` | `sx`, `sy`, `stheta` | Graded run |
-| --- | --- | --- | --- |
-| Levine | `'maps/levine_blocked'` | `-12.0`, `0.0`, `0.0` (the stock start pose) | three laps in a row, counter-clockwise |
-| Spielberg | `'maps/Spielberg'` | `14.59`, `3.92`, `-2.877` | one lap, in the direction of its centerline |
-
-Both maps come with a centerline. You can check your lap count and lap time using the `/ego_racecar/lap_count` topic and the `completed lap N, last lap X s` line in the bridge log respectively. These lap times are what we check with the autograder.
-
-**One launch file per track.** The autograder tests your code using the two launch files in the `mppi/launch/` folder:
-
-```bash
-ros2 launch mppi levine_launch.py      # three laps of Levine (and the pose checks)
-ros2 launch mppi spielberg_launch.py   # one lap of Spielberg
+# Head-to-head racing for F1TENTH: see the other car, follow it, pass it
+
+A head-to-head layer on top of an MPPI raceline controller for 1/10-scale race cars.
+The car finds other cars with its **LiDAR only**, estimates where they are going, and
+decides between four behaviours: drive its own line, **follow**, **pass**, or take a
+**switchback** through a corner the car ahead is defending.
+
+Nothing the simulator knows about the other cars (their odometry) reaches the controller:
+on the real car the laser scan is all there is, so that is all the code uses.
+
+```
+ /scan + static map                                   raceline (x, y, yaw, v)
+        |                                                      |
+        v                                                      v
+ OpponentTracker  -- tracks (s, d, vs, vd) -->  Tactician  -->  shifted reference line
+ clusters + Kalman filter                       FREE / FOLLOW /   + speed cap
+        |                                       PASS / SWITCHBACK       |
+        |                                                               v
+        +------- predicted opponent poses over the horizon ---------> MPPI --> /drive
 ```
 
-You can edit these launch files for your specific setup; i.e: set `EXECUTABLE` to the node you wrote (`mppi_node.py` by default). Each launch file passes `track` (`levine` or `spielberg`) to your node so it knows which waypoints to load. For Spielberg the simulator ships a centerline and an optimised raceline, `maps/Spielberg_centerline.csv` and `maps/Spielberg_raceline.csv`: you may use either, reshape them, or make your own.
+The MPPI controller itself (dynamics, sampling, static-obstacle avoidance) is the team's
+course controller and is not described here. Everything below is in
+[mppi/scripts/h2h.py](mppi/scripts/h2h.py), plus the moving-car cost in
+[mppi/scripts/mppi_node.py](mppi/scripts/mppi_node.py).
 
-**Ship your waypoints with your package.** Put your CSV files in `mppi/waypoints/`; the skeleton's `CMakeLists.txt` installs that folder by default. To get the CSV file from your node, use `get_package_share_directory('mppi')` (from `ament_index_python.packages`) so you can fetch the installed files. A path like `/home/you/sim_ws/...` only exists on your machine, so when the autograder runs your node, it would die at start-up because the absolute path is not the same as the autograder's workspace.
+## 1. Seeing the opponent
 
-## IX. Deliverables and Submission
+`OpponentTracker` turns each scan into a list of tracked cars.
 
-As in previous labs, this is a team assignment.
+1. **What is not the track is a car.** Scan returns are projected into the map frame. A
+   return closer than 0.25 m to a wall of the static map is wall; the rest are candidates.
+   This is purely geometric, so an opponent driving at exactly the ego's speed is found
+   just as well as a slow one.
+2. **Clusters.** Consecutive candidates are split where they are more than 0.3 m apart.
+   A cluster needs at least 3 returns and may be at most 0.9 m across.
+3. **One Kalman filter per car.** State `[x, y, vx, vy]` in the map frame,
+   constant-velocity model, position measurements. Detections are matched to tracks by
+   nearest neighbour inside a 0.8 m gate. A track counts after 5 hits and coasts for
+   0.6 s without a detection.
+4. **Frenet coordinates.** Each track is projected onto the raceline: station `s`, sideways
+   offset `d`, speed along the line `vs` and across it `vd`. All decisions are made in
+   these coordinates, so "ahead", "inside" and "how much room is left to the wall" are
+   one-dimensional questions.
 
-### a. Accepting the Assignment
+Two details matter on the real car:
 
-Each team member can accept the assignment by running:
+- **The laser does not see a car, it sees a box.** The scan plane is above most of the
+  chassis; what is guaranteed to be there is the 12 x 12 cm box the rules require at the
+  back of every car. The tracker is tuned on that box, and the car's centre is placed ahead
+  of it along the raceline's direction (the velocity direction from so few returns is too
+  noisy to use as a heading).
+- **Standing or moving.** A track is "moving" above 0.4 m/s along the line, with
+  hysteresis. Moving cars are removed from the scan before the static-obstacle code sees
+  it, so they are handled once, as cars.
+
+## 2. Deciding: FREE / FOLLOW / PASS / SWITCHBACK
+
+`Tactician` looks at the nearest moving car ahead and picks a state every control step.
+
+**FOLLOW** is an adaptive-cruise speed cap, the lowest of three:
+
+- a gap law: the opponent's speed plus a gain on the error to the wanted bumper gap
+  (`follow_gap + follow_time * v`);
+- a braking law: never faster than the ego can still brake down to the opponent's speed in
+  the gap it has, after its own reaction time (pose age + control step + actuation);
+- never much above the ego's current speed, so the controller does not accelerate at its
+  limit into a cap that is about to drop.
+
+The opponent's speed used here is the one it is *about to have*: it will brake for the
+corner in front of it, as the raceline's speed profile does, scaled by its current pace.
+
+**PASS** starts where the ego is meaningfully faster and there is a straight stretch with
+room to move up *next to* the opponent, on either side. The pass does not have to be
+finished before the straight ends:
+
+- The planner predicts where the opponent will be while the ego closes from "first overlap"
+  to "side by side", and searches that stretch of the opponent's path for enough width
+  between the car and the wall and low enough curvature.
+- The opponent's speed is predicted from its **pace** (its speed relative to the raceline's
+  profile, averaged over the last seconds), not from its speed at one instant.
+- It chooses the side that opens first; if both do, the one that stays open longer, with a
+  preference for the inside of the next corner.
+- The ego may wait behind the car for the room to open, and may change sides once.
+- A pass does not start while the ego is itself in a corner, with a bend just ahead on its
+  own path, or right behind the other car's bumper.
+- A pass that is not working is given up, and the ego drops back gently beside the car
+  instead of braking hard.
+
+**Holding the inside.** Once the ego is beside the opponent, on the inside of the corner
+ahead, and faster (or its nose is in front), the corner is the ego's: it keeps its line and
+speed, and the opponent is predicted to stay on its offset.
+
+**SWITCHBACK** is for a car that defends the inside before a corner. Following it into the
+corner on the raceline is pointless, because the raceline's apex is where the other car is.
+The ego instead takes the **late-apex line**: wide on the way in, a later and tighter
+turn, then out on the inside while the defender, who turned in early, runs wide.
+
+![Switchback through a left-hand corner: defender on the early-apex line, attacker on the late-apex line](mppi/waypoints/switchback_diagram.png)
+
+*Orange: defender on the early-apex line. Blue: attacker on the late-apex line. Equal
+numbers are the same instant. The attacker crosses behind the defender at the apex and is
+ahead on the following straight.*
+
+The late-apex and early-apex lines are computed offline per corner with the same lap-time
+model as the raceline ([scripts/make_apex_lines.py](scripts/make_apex_lines.py)). They are
+stored as sideways offsets from the raceline, one per waypoint, so switching lines is
+switching arrays.
+
+![Raceline, early-apex and late-apex lines on the race map](mppi/waypoints/race2_raceline_opt_apex.png)
+
+A switchback starts only when the opponent really is on the inside, the ego is close
+enough, and it has the entry speed. It is given up before the turn-in if the opponent goes
+to the outside after all.
+
+## 3. Acting: what the controller receives
+
+The tactician never steers. It hands MPPI three things:
+
+- **A shifted reference line.** For a pass, the raceline is moved sideways next to where
+  the opponent *will be*, blended back to the raceline before and after. The shift is
+  limited to 0.2 m sideways per metre, starts from the car's own position, is kept inside
+  the track, and gets its own curvature-based speed profile.
+- **A speed cap** for following.
+- **Predicted opponent poses** over the horizon, for up to three cars: each keeps its speed
+  along the raceline and its sideways offset. MPPI's cost has a hard term for contact and a
+  soft margin around each car, evaluated at the matching time step of every rollout. The
+  soft margin is smaller for the car being passed, because next to it is where the ego
+  wants to be.
+
+## 4. A simulator that behaves like the car
+
+The two-car simulation is built on
+[f1tenth_gym_ros](https://github.com/f1tenth/f1tenth_gym_ros) with a few extra nodes, so that
+what is tuned in simulation is tuned for the real car:
+
+| Node | What it does |
+| --- | --- |
+| [scan_box_node.py](mppi/scripts/scan_box_node.py) | Replaces each opponent's full body in the simulated scan with its 12 cm rear box. |
+| [latency_node.py](mppi/scripts/latency_node.py) | Adds the delays measured on the car: late pose, slow control rate, actuation lag (about 0.3 s in total). |
+| [pose_fusion_node.py](mppi/scripts/pose_fusion_node.py) | Brings the late particle-filter pose up to now with wheel speed and gyro. |
+| [opponent_node.py](mppi/scripts/opponent_node.py) | A pure-pursuit opponent with a speed scale and a sideways offset. The opponent can also run the same MPPI as the ego. |
+
+## Running it
+
+Requirements: ROS 2 Jazzy with [f1tenth_gym_ros](https://github.com/f1tenth/f1tenth_gym_ros)
+(`dev-jazzy` branch) in the same workspace, and Python with `jax`, `numpy`, `scipy`.
 
 ```bash
-gh student accept RoboRacer-Class ese-6150 lab-8-model-predictive-path-integral
+colcon build --packages-select mppi
+source install/setup.bash
 ```
-
-The team member that accepts the assignment first creates the team's shared repository, `ese-6150-lab-8-model-predictive-path-integral-group-<n>`. Make sure you coordinate pushes, branches and commits. One submission is the whole team's submission, so every member gets the same grade for the lab.
-
-### b. Deliverables
-
-There are two deliverables and one bonus for this lab:
-
-- **Deliverable 1**: Your `mppi` package with its waypoints. Your code should successfully complete three consecutive laps of Levine and one lap of Spielberg, without touching a wall, in the simulator. The leaderboards track your team's fastest lap on each track.
-
-- **Deliverable 2**: Links to two videos in **`SUBMISSION.md`** (YouTube unlisted, or Google Drive shared as **"Anyone with the link can view"**): the car tracking waypoints with MPPI in Levine in the simulator, with the sampled rollouts visible in RViz, and on the real car in Levine hallway.
-
-- **Bonus**: The Euler and RK4 comparison of Section II.b in **`SUBMISSION.md`**, truncated proposal distribution, and covariance update.
-
-### c. Submitting
-
-You can commit and push your work as often as you need, as a plain push does **not** count as a submission. When your team is ready to submit, any member can push a tagged commit named `submission` which then counts as a submission for the whole team. You can do so using:
 
 ```bash
-# Make sure you've pulled before or switch branches
-git push                            # your commits
-git tag submission
-git push origin submission          # this triggers the autograder
+ros2 launch mppi h2h_sim_launch.py                       # ego vs one slow opponent (0.6x)
+ros2 launch mppi h2h_sim_launch.py opp_speed_scale:=0.9 opp_offset:=-0.3
+ros2 launch mppi h2h_sim_launch.py num_agents:=4         # four cars
+ros2 launch mppi h2h_sim_launch.py h2h_pass:=false       # follow only
+ros2 launch mppi h2h_sim_launch.py h2h:=false            # baseline: no head-to-head logic
+ros2 launch mppi h2h_sim_launch.py latency:=false        # ideal simulator, no delays
+ros2 launch mppi h2h_sim_launch.py open_foxglove:=true   # with the viewer
 ```
 
-### d. Grading
-
-The autograder builds your package, checks your MPPI and drives it around Levine and Spielberg in the simulator, then posts your score as a **Release** on your repo (check the Releases page or the commit's status check a few minutes after you tag). To resubmit, move the tag to a new commit:
+Switchback test, two equal cars, the opponent on the early-apex line and the ego 1.5 m
+behind it:
 
 ```bash
-git tag -f submission
-git push --force origin submission
+ros2 launch mppi h2h_sim_launch.py latency:=false pace:=race raceline:=race2_raceline_opt.csv \
+    opp_controller:=mppi opp_line:=race2_raceline_opt_earlyapex.csv start_gap:=1.5 \
+    switchback:=race2_raceline_opt_apex.json
 ```
 
-The `submission` push with the best grade is counted as your team's final submission and grade. The leaderboards are independent as each track has its own launch file.
+One measured run (lap times, overtakes, collisions, closest distance):
 
-**The autograder finds your work by name.** Package `mppi`, launch files `levine_launch.py` and `spielberg_launch.py`, subscribing to the pose from `/ego_racecar/odom` and publishing `AckermannDriveStamped` on `/drive`. Otherwise, the autograder will not be able to grade your work and your submission may get the wrong grade.
+```bash
+scripts/run_h2h.sh 60 /tmp/run.json opp_speed_scale:=0.6
+```
 
-**Only the topics the lab needs.** Your nodes may read the simulator's localisation (`/ego_racecar/odom`, `/tf`), `/scan` and `/initialpose`, and publish to `/drive` and to topics only your own nodes use (e.g. your visualization markers). The autograder watches the ROS graph while your code runs: a node that reads the lap counter or the collision flag, or publishes on a topic the simulator or the autograder listens to (`/initialpose`, which teleports the car, `/ego_racecar/odom`, the lap counter, ...) gets a 0 grade for the whole submission.
+The head-to-head parameters are the `h2h_*` parameters of `mppi_node.py`; the full list of
+launch arguments is at the top of
+[mppi/launch/h2h_sim_launch.py](mppi/launch/h2h_sim_launch.py).
 
-## X: Grading Rubric
-- Compilation: **10** Points (autograded)
-- Correct dynamics, cost and update: **50** Points (autograded without the simulator, 10 per check: your node is initialized with random poses of the car and must steer the right way while satisfying the acceleration and steering limits).
-- Path tracking: **20** Points
-  - **10** Points (autograded in simulation: three counter-clockwise laps of `levine_blocked` in a row without touching a wall; a run that ends early earns partial credit for the fraction covered; the fastest of the three laps goes to the Levine leaderboard)
-  - **10** Points (autograded in simulation: one lap of `Spielberg` without touching a wall, with partial credit; the lap time goes to the Spielberg leaderboard)
-- Videos (TA-graded from the links in `SUBMISSION.md`):
-   - In sim: **10** Points
-   - On Car: **10** Points
-- Bonus (**15** Points total): 
-   - RK4 discretization: **5** Points (TA-graded from the Euler and RK4 comparison in `SUBMISSION.md`)
-   - Truncated proposal distribution: **5** Points (TA-graded from the code)
-   - Covariance Update: **5** Points (TA-graded from the code)
+## Where things are
+
+| Path | Content |
+| --- | --- |
+| `mppi/scripts/h2h.py` | `TrackFrame` (Frenet frame + free width from the map), `OpponentTracker`, `Tactician`, opponent prediction |
+| `mppi/scripts/mppi_node.py` | MPPI controller, the moving-car cost, and the glue (`h2h_step`) |
+| `mppi/scripts/lines.py` | Alternative racing lines as offsets from the raceline, and their speed profiles |
+| `mppi/launch/h2h_sim_launch.py` | Two-car (up to four-car) simulation |
+| `scripts/optimize_raceline.py` | Minimum-lap-time raceline for a map |
+| `scripts/make_apex_lines.py` | Early-apex and late-apex lines per corner |
+| `scripts/h2h_monitor.py`, `scripts/run_h2h.sh` | Measure a run: overtakes, collisions, gaps |
+| `scripts/draw_switchback.py` | The switchback picture above |
+
+## Status
+
+Work in progress, tested in simulation only; the head-to-head layer has not run on the
+real car yet.
+
+- At the last measured checkpoint the ego followed without contact in four 50 s runs
+  (three behind a 0.92x defender, one behind an equal car), but did not complete an
+  overtake against either.
+- The pass logic has been reworked since then (get beside the car instead of clear ahead;
+  pace-based prediction) and has not been re-measured in the same way.
+- Judging corners by the speed actually driven there (`h2h_grip_use`) is off by default:
+  it enabled a pass on the inside into a hairpin, but also caused a crash in testing.
+
+## Credits
+
+Built on the team's MPPI controller from ESE 6150 (University of Pennsylvania) and on the
+F1TENTH gym simulator. See [LICENSE](LICENSE).
