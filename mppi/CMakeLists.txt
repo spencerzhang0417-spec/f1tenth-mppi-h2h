@@ -21,8 +21,13 @@ ament_python_install_package(${PROJECT_NAME})
 # Install Python executables
 install(PROGRAMS
   scripts/mppi_node.py
+  scripts/opponent_node.py
+  scripts/latency_node.py
+  scripts/scan_box_node.py
+  scripts/lines.py
   scripts/pose_fusion.py
   scripts/pose_fusion_node.py
+  scripts/h2h.py
   scripts/utils.py
   DESTINATION lib/${PROJECT_NAME}
 )
@@ -33,7 +38,7 @@ install(DIRECTORY launch
 )
 
 # Install the waypoint files, so the node finds them wherever the package is built
-install(DIRECTORY waypoints
+install(DIRECTORY waypoints maps config
   DESTINATION share/${PROJECT_NAME}
 )
 
