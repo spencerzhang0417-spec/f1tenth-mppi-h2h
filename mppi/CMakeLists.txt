@@ -21,6 +21,8 @@ ament_python_install_package(${PROJECT_NAME})
 # Install Python executables
 install(PROGRAMS
   scripts/mppi_node.py
+  scripts/pose_fusion.py
+  scripts/pose_fusion_node.py
   scripts/utils.py
   DESTINATION lib/${PROJECT_NAME}
 )
