@@ -25,12 +25,13 @@ from make_track_bounds import load_map  # noqa: E402
 
 ORANGE, BLUE = (235, 110, 0), (0, 90, 225)
 CAR_L, CAR_W = 0.58, 0.31
-CJK = '/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc'
+CJK = '/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc'   # has the circled digits of the labels
+FOOT = 185   # [px] legend and assumptions below the picture
 
 
 def font(size):
     try:
-        return ImageFont.truetype(CJK, size, index=2)   # Simplified Chinese face of the collection
+        return ImageFont.truetype(CJK, size, index=2)
     except OSError:
         return ImageFont.load_default()
 
@@ -75,7 +76,7 @@ def main():
     y0, y1 = pts[:, 1].min() - 1.5, pts[:, 1].max() + 1.2
     k = 175
     W, H = int((x1 - x0) * k), int((y1 - y0) * k)
-    img = Image.new('RGB', (W, H + 150), (255, 255, 255))
+    img = Image.new('RGB', (W, H + FOOT), (255, 255, 255))
     dr = ImageDraw.Draw(img, 'RGBA')
     P = lambda x, y: ((x - x0) * k, (y1 - y) * k)
     rr, cc = np.nonzero(~free)
@@ -83,7 +84,7 @@ def main():
         x, y = org[0] + c * res, org[1] + r * res
         if x0 - 0.1 < x < x1 and y0 - 0.1 < y < y1:
             dr.rectangle([P(x, y + res), P(x + res, y)], fill=(120, 120, 120))
-    dr.rectangle([0, H, W, H + 150], fill=(255, 255, 255))
+    dr.rectangle([0, H, W, H + FOOT], fill=(255, 255, 255))
 
     # raceline dashed, the two lines solid
     for j in range(0, len(seg) - 2, 4):
@@ -132,29 +133,37 @@ def main():
         dr.ellipse([px - 16, py - 16, px + 16, py + 16], outline=(0, 0, 0, 255), width=4)
         dr.line([px - 11, py - 11, px + 11, py + 11], fill=(0, 0, 0, 255), width=3)
         dr.line([px - 11, py + 11, px + 11, py - 11], fill=(0, 0, 0, 255), width=3)
-        label('交叉点：进攻车从防守车\n车尾后方切回内侧', (cx, cy), (150, 60))
+        label('Crossing point: the attacker cuts back\nto the inside behind the defender', (cx, cy), (150, 60))
     v = lambda w, i: f'{w[i, 3]:.1f} m/s'
-    label(f'① 入弯：防守车占内线（早 apex）\n    进攻车留在外侧，不跟进去', de[idf[1], :2], (-880, 190), ORANGE)
-    label(f'② 弯心：防守车线太紧，减到 {de[seg, 3].min():.1f} m/s\n    并被甩向外侧', de[int(seg[np.argmin(de[seg, 3])]), :2], (130, -70), ORANGE)
-    label(f'③ 进攻车走深、晚转向，\n    弯心速度 {att[seg, 3].min():.1f} m/s', att[ia[2], :2], (-60, 120), BLUE)
-    label(f'④ 出弯：进攻车在内侧 {v(att, ia[-2])}\n    防守车在外侧 {v(de, idf[-2])}', att[ia[-2], :2], (-330, 60), BLUE)
+    label('① Entry: the defender covers the inside (early apex);\n    the attacker stays outside and does not follow it in',
+          de[idf[1], :2], (-880, 190), ORANGE)
+    label(f'② Apex: the defender\'s line is too tight:\n    down to {de[seg, 3].min():.1f} m/s, and it runs wide',
+          de[int(seg[np.argmin(de[seg, 3])]), :2], (130, -70), ORANGE)
+    label(f'③ The attacker goes deep and turns late,\n    slowest point {att[seg, 3].min():.1f} m/s', att[ia[2], :2], (-60, 120), BLUE)
+    label(f'④ Exit: attacker on the inside at {v(att, ia[-2])},\n    defender on the outside at {v(de, idf[-2])}', att[ia[-2], :2], (-330, 60), BLUE)
     lead = (td[-1] - ta[-1]) * att[seg[-1], 3]
-    label(f'⑤ 直道：进攻车领先 {lead:.1f} m' if lead > 0 else f'⑤ 直道：进攻车仍落后 {-lead:.1f} m',
+    label(f'⑤ Straight: attacker {lead:.1f} m ahead' if lead > 0 else f'⑤ Straight: attacker still {-lead:.1f} m behind',
           att[ia[-1], :2], (-120, -110), BLUE)
 
     # legend and the assumptions, below the picture
-    dr.text((20, H + 10), 'Switchback 超车（%s，左弯）' % args.corner, fill=(0, 0, 0), font=f_big)
-    dr.line([20, H + 78, 80, H + 78], fill=ORANGE + (255,), width=6)
-    dr.text((90, H + 60), '防守车：early apex 线', fill=(0, 0, 0), font=f_mid)
-    dr.line([420, H + 78, 480, H + 78], fill=BLUE + (255,), width=6)
-    dr.text((490, H + 60), '进攻车：late apex 线', fill=(0, 0, 0), font=f_mid)
-    for j in range(0, 60, 16):
-        dr.line([820 + j, H + 78, 828 + j, H + 78], fill=(90, 90, 90, 255), width=3)
-    dr.text((890, H + 60), 'raceline', fill=(0, 0, 0), font=f_mid)
-    same = '同一辆车' if abs(args.defender_a_lat - lim['a_lat']) < 1e-6 else \
-        f'防守车弯心速度取仿真实测的 {de[seg, 3].min():.1f} m/s'
-    dr.text((20, H + 105), f'相同编号 = 同一时刻，间隔 {times[1] - times[0]:.2f} s，颜色越深越晚。进攻车起步落后 {args.gap:.1f} m；'
-                           f'位置按速度模型计算（完美跟踪），{same}。', fill=(60, 60, 60), font=f_small)
+    dr.text((20, H + 10), 'Switchback overtake (%s, %s-hand corner)'
+            % (args.corner, 'left' if co['inside'] > 0 else 'right'), fill=(0, 0, 0), font=f_big)
+    x = 20
+    for text, col in (('Defender: early-apex line', ORANGE), ('Attacker: late-apex line', BLUE), ('raceline', None)):
+        if col is None:
+            for j in range(0, 60, 16):
+                dr.line([x + j, H + 78, x + j + 8, H + 78], fill=(90, 90, 90, 255), width=3)
+        else:
+            dr.line([x, H + 78, x + 60, H + 78], fill=col + (255,), width=6)
+        dr.text((x + 70, H + 60), text, fill=(0, 0, 0), font=f_mid)
+        x += 70 + int(dr.textlength(text, font=f_mid)) + 50
+    same = 'the defender is the same car' if abs(args.defender_a_lat - lim['a_lat']) < 1e-6 else \
+        f"the defender's slowest point is the {de[seg, 3].min():.1f} m/s measured in the simulator"
+    dr.multiline_text((20, H + 105),
+                      f'Equal numbers = the same instant, {times[1] - times[0]:.2f} s apart; darker = later. '
+                      f'The attacker starts {args.gap:.1f} m behind.\n'
+                      f'Positions from the speed model (perfect tracking); {same}.',
+                      fill=(60, 60, 60), font=f_small, spacing=6)
     img.save(args.out)
     print(f'wrote {args.out} ({img.size[0]} x {img.size[1]}); lead at the end {lead:+.2f} m; '
           f'defender slowest {de[seg, 3].min():.2f}, attacker slowest {att[seg, 3].min():.2f} m/s')
