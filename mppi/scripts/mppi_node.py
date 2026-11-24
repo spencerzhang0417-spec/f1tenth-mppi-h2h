@@ -34,7 +34,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from ament_index_python.packages import get_package_share_directory
 from nav_msgs.msg import Odometry, OccupancyGrid
 from geometry_msgs.msg import Point
-from std_msgs.msg import ColorRGBA
+from std_msgs.msg import ColorRGBA, Float64
 from visualization_msgs.msg import Marker, MarkerArray
 from sensor_msgs.msg import LaserScan
 from scipy.ndimage import distance_transform_edt
@@ -889,7 +889,8 @@ def bend_reference(ref, path, o_path):
     return out
 
 
-def narrow_gap_ahead(path, o_path, obs, cfg, clearance, start=0.3, max_offset=1.0, step=0.1, blind=0.1):
+def narrow_gap_ahead(path, o_path, obs, cfg, clearance, start=0.3, max_offset=1.0, step=0.1, blind=0.1,
+                     map_clear=None):
     """
     Added: distance [m] along path to the first point of the planned (bent) path whose clearance in
     the grid is below `clearance`, or None. Only the part of the path the grid can judge counts: the
@@ -897,6 +898,10 @@ def narrow_gap_ahead(path, o_path, obs, cfg, clearance, start=0.3, max_offset=1.
     space around a corner is all blocked in the grid -- not a narrow gap). Points closer than `start`
     are where the car already is. wobble_1103_2012: a 0.6 m gap between the inside wall and an
     obstacle at a corner entry, reached at 2.7-2.8 m/s; the front slowdown only acted 0.4 s before
+    :param map_clear: (added) f(x, y) -> distance to the walls of the static map. With it a point
+        is narrow only if something that is NOT on the map makes it so (the grid's clearance is
+        0.15 m below the map's): the raceline itself runs 0.42-0.5 m from the walls at every
+        corner, and the car braked for its own track as for a gap between obstacles (0.2 s a lap)
     :return: distance or None, the path's clearance (M,)
     """
     dist, ox, oy = np.asarray(obs[0]), float(obs[1]), float(obs[2])
@@ -920,7 +925,10 @@ def narrow_gap_ahead(path, o_path, obs, cfg, clearance, start=0.3, max_offset=1.
     judged = (best >= blind) & np.isfinite(clr)
     stop = int(np.argmin(judged)) if not judged.all() else M     # first point the grid cannot judge
     s = np.arange(M) * ds
-    hit = np.where((s[:stop] >= start) & (clr[:stop] < clearance))[0]
+    narrow = clr < clearance
+    if map_clear is not None:
+        narrow &= clr < map_clear(path[:, 0] + o_path * nx, path[:, 1] + o_path * ny) - 0.15
+    hit = np.where((s[:stop] >= start) & narrow[:stop])[0]
     return (float(s[hit[0]]) if len(hit) else None), clr
 
 
@@ -1093,6 +1101,9 @@ class MPPI(Node):
         # (wobble_1103_1910) DT turned a planned -1.2 m/s^2 into a command only 0.06 m/s under the speed:
         # measured -0.23 m/s^2, so the car could not slow down for the corners
         self.declare_parameter('brake_lead_time', float(MPPIConfig.DT))
+        self.declare_parameter('speed_cmd_predicted', False)   # see where the drive message is built
+        self.declare_parameter('steer_rate', 0.0)   # [rad/s] how fast the wheels turn; 0 = at once (latency prediction)
+        self.steer_act, self.steer_act_t = None, 0.0
         # added: MPPI weights / sampling as ROS parameters (defaults = MPPIConfig)
         self.declare_parameter('Q', list(MPPIConfig.Q))
         self.declare_parameter('Qf', list(MPPIConfig.Qf))
@@ -1123,7 +1134,55 @@ class MPPI(Node):
             wp_path = os.path.join(wp_dir, opts['fallback'])
         x_col, y_col, v_col = detect_columns(wp_path)
         self.waypoints = load_waypoints(wp_path, x_col, y_col, v_col, **opts)
+        # added: drive another line of a line set (scripts/make_apex_lines.py) instead of the
+        # raceline itself, e.g. the defender's early-apex line, in all corners or in some. For
+        # opponents in the simulator: a car that covers the inside of exactly the corner under test.
+        self.declare_parameter('line_set', '')        # json in waypoints/ ('' = the waypoint file as it is)
+        self.declare_parameter('line_key', 'defend')  # 'defend' (early apex) or 'attack' (late apex)
+        self.declare_parameter('line_corners', '')    # 'tight_mid' or 'a,b': only there ('' = every corner)
+        if self.get_parameter('line_set').value:
+            ls = lines_lib.load_line_set(os.path.join(wp_dir, self.get_parameter('line_set').value))
+            d = np.array(ls[self.get_parameter('line_key').value], dtype=float)
+            only = [c for c in str(self.get_parameter('line_corners').value).split(',') if c]
+            if only:
+                s_ls, keep = np.arange(len(d)) * ls['ds'], np.zeros(len(d), dtype=bool)
+                for c in ls['corners']:
+                    if c['name'] in only:
+                        a = min(c['s_defend'], c['s_split'], key=lambda q: (q - c['s_apex']) % (len(d) * ls['ds']))
+                        b = max(c['s_end'], c.get('s_defend_end', c['s_end']), key=lambda q: (q - c['s_apex']) % (len(d) * ls['ds']))
+                        keep |= (s_ls - a) % (len(d) * ls['ds']) <= (b - a) % (len(d) * ls['ds'])
+                d = np.where(keep, d, 0.0)
+            self.waypoints = lines_lib.make_waypoints(
+                self.waypoints[:, :2], lines_lib.fit_offsets(d, len(self.waypoints)),
+                a_lat=opts['a_lat'], a_lon=opts['a_lon'], v_min=opts['v_min'], v_max=opts['v_max'])
+            self.get_logger().info(f"line '{self.get_parameter('line_key').value}' of {self.get_parameter('line_set').value}"
+                                   f"{' in ' + ', '.join(only) if only else ''}: up to {np.abs(d).max():.2f} m from the raceline")
         self.waypoints[:, 3] *= float(self.get_parameter('speed_scale').value)
+        # added: drive one stretch of the lap slower, [from station, to station, factor] (empty =
+        # no). For an opponent in the simulator that is slower on the straight before a corner
+        # and as fast as the ego in it: the car a faster ego finds itself behind at the braking point.
+        self.declare_parameter('slow_zone', [0.0])
+        zone = list(self.get_parameter('slow_zone').value)
+        if len(zone) == 3:
+            n_wp, ds_wp = len(self.waypoints), WAYPOINT_SPACING
+            s_wp, lap = np.arange(n_wp) * ds_wp, n_wp * ds_wp
+            v = self.waypoints[:, 3]
+            v[(s_wp - zone[0]) % lap <= (zone[1] - zone[0]) % lap] *= zone[2]
+            for _ in range(2):      # and into / out of it with the acceleration the profile has elsewhere
+                for i in range(1, 2 * n_wp):
+                    v[i % n_wp] = min(v[i % n_wp], np.sqrt(v[(i - 1) % n_wp] ** 2 + 2.0 * opts['a_lon'] * ds_wp))
+                for i in range(2 * n_wp - 2, -1, -1):
+                    v[i % n_wp] = min(v[i % n_wp], np.sqrt(v[(i + 1) % n_wp] ** 2 + 2.0 * opts['a_lon'] * ds_wp))
+        # added: stand still until this time (unix seconds; 0 = go at once). The simulator's cars
+        # get the same value from the launch file and so set off in the same instant, whichever
+        # controller was up first.
+        self.declare_parameter('start_time', 0.0)
+        self.start_time = float(self.get_parameter('start_time').value)
+        # ... and again after every /sim/restart (a unix time): the cars have been put back on
+        # their start poses and set off at that time plus this node's start_offset [s]. For
+        # replaying one corner over and over (scripts/sb_replay.py).
+        self.declare_parameter('start_offset', 0.0)
+        self.restart_sub = self.create_subscription(Float64, '/sim/restart', self.restart_callback, 1)
         self.get_logger().info(f"track '{track}': {len(self.waypoints)} waypoints from {wp_path} "
                                f"(speed {'from csv' if v_col is not None else 'from curvature'}), "
                                f"v_ref in [{self.waypoints[:, 3].min():.1f}, {self.waypoints[:, 3].max():.1f}] m/s")
@@ -1160,7 +1219,16 @@ class MPPI(Node):
         steer_right = float(self.get_parameter('max_steer_right').value)
         steer_left = steer_left if steer_left >= 0.0 else max_steer
         steer_right = steer_right if steer_right >= 0.0 else max_steer
+        # yaw_gain: how much of the yaw rate of the bicycle model (v tan(delta) / wheelbase) the
+        # car really turns with. The model in MPPI's rollouts and in the latency prediction is
+        # that kinematic one; the simulated car turns 0.87 of it when it corners near the limit
+        # (understeer). Without delay MPPI corrects that 100 times a second and nobody notices.
+        # With the car's 0.19 s of delay it plans as if it turned 13 % more than it does, and
+        # ends 0.4-0.6 m wide at every corner. As a longer wheelbase in the model: WB / yaw_gain.
+        self.declare_parameter('yaw_gain', 1.0)
+        yaw_gain = float(np.clip(self.get_parameter('yaw_gain').value, 0.5, 1.5))
         overrides = dict(MAX_SPEED=float(self.get_parameter('max_speed').value),
+                         WB=MPPIConfig.WB / yaw_gain,
                          MAX_STEER=steer_left,
                          MIN_STEER=-steer_right,
                          T=int(self.get_parameter('num_samples').value),
@@ -1255,13 +1323,15 @@ class MPPI(Node):
         # a full control step, so on a slow computer 10 iterations = a long blind gap, and a gap
         # longer than H*DT triggers the next reset -> keep it small on the car
         self.declare_parameter('cold_iters', int(MPPIConfig.N_ITER_COLD))
+        self.declare_parameter('warm_iters', int(MPPIConfig.N_ITER))   # MPPI updates per control step
         self.t_grid = 0.0
         self.t_bend = 0.0
         self.declare_parameter('recovery', False)   # experimental: unreliable in tests, off
         self.declare_parameter('stuck_time', 1.0)       # [s]
-        self.declare_parameter('reverse_time', 0.7)     # [s]
+        self.declare_parameter('reverse_time', 0.8)     # [s] shortest; up to 2.5 x when the nose is far off
         self.declare_parameter('reverse_speed', -0.6)   # [m/s]
         self.stuck_since = None
+        self.stuck_at = None    # where the car was when it last moved on
         self.recover_until = None
         self.recover_steer = 0.0
         self.avoid = bool(self.get_parameter('avoid_obstacles').value)
@@ -1318,7 +1388,14 @@ class MPPI(Node):
         # up on the inside into a corner), e.g. 0.7 = 70 % of the grip. Off: it crashed in tests
         self.declare_parameter('h2h_grip_use', 0.0)
         self.declare_parameter('h2h_pass_wait', 3.0)     # [m] a pass may start this far before its room opens
+        # [s] stand still this long after the map is there. For the simulator, where the
+        # opponent's controller starts 1-3 s after the ego's: the ego then reached a car that was
+        # only just moving off at 4 m/s. 0 on the car.
+        self.declare_parameter('h2h_start_hold', 0.0)
+        self.h2h_go_t = None
         self.declare_parameter('h2h_standing_cars', True)  # tracked objects that stand still count as car bodies
+        self.declare_parameter('h2h_scan_motion', True)    # bring the scan from its own time to the pose's
+        self.declare_parameter('h2h_standing_speed', 1.8)  # [m/s] past a car that stands on the track
         self.declare_parameter('h2h_react_time', 0.35)
         # the laser sees a car's rear box (12 x 12 x 20 cm, required on every car): True = a cluster
         # is that box, the car's center 0.23 m ahead of it; False = a cluster is the car's body
@@ -1334,6 +1411,14 @@ class MPPI(Node):
         self.declare_parameter('h2h_sb_speed', 0.8)     # entry speed needed, as a fraction of the raceline's
         self.declare_parameter('h2h_sb_corners', '')    # 'corner2' or 'corner1,corner2': only these ('' = all)
         self.declare_parameter('h2h_sb_commit', False)  # True: a started switchback is never given up
+        # [m] a corner is armed only if the line model predicts that the late-apex line gains at
+        # least this much on a car that covers the inside there ('gain_m' of make_apex_lines.py).
+        # Where the inside line costs the defender little (a hairpin around a thin island) or
+        # there is no room to cut back (a narrow corner), going wide only loses ground.
+        self.declare_parameter('h2h_sb_min_gain', 1.0)
+        # the line model at run time: time the switchback by who is first where the lines cross,
+        # and predict a car that covers the inside along the defender's line
+        self.declare_parameter('h2h_sb_model', True)
         # right of way: next to a car, on the inside of the corner ahead and faster (or already ahead)
         # -> keep the line and the speed instead of following / braking when it closes the door
         self.declare_parameter('h2h_claim', True)
@@ -1370,20 +1455,39 @@ class MPPI(Node):
             self.h2h_limits = dict(a_lat=opts['a_lat'], a_lon=opts['a_lon'], v_min=opts['v_min'], v_max=opts['v_max'])
             self.h2h_speed_scale = float(self.get_parameter('speed_scale').value)
             sb_corners, self.h2h_attack_wps = [], None
+            self.h2h_sb_model = None
             if gp('h2h_lines'):
                 ls = lines_lib.load_line_set(os.path.join(wp_dir, gp('h2h_lines')))
                 d_att = lines_lib.fit_offsets(ls['attack'], len(self.waypoints))
+                self.h2h_attack_d = d_att
                 self.h2h_attack_wps = lines_lib.make_waypoints(
                     self.waypoints[:, :2], d_att, a_lat=opts['a_lat'], a_lon=opts['a_lon'],
                     v_min=opts['v_min'], v_max=opts['v_max'])
                 self.h2h_attack_wps[:, 3] = np.clip(
                     self.h2h_attack_wps[:, 3] * float(self.get_parameter('speed_scale').value), 0.0, cfg.MAX_SPEED)
+                # the same lines as the line model drives them, for the timing of the switchback
+                # and for predicting a car that covers the inside (Tactician._sb_timing, sb_predict)
+                d_def = lines_lib.fit_offsets(ls['defend'], len(self.waypoints))
+                def_wps = lines_lib.make_waypoints(self.waypoints[:, :2], d_def, a_lat=opts['a_lat'], a_lon=opts['a_lon'],
+                                                   v_min=opts['v_min'], v_max=opts['v_max'])
+
+                def lap_clock(w):
+                    seg = np.hypot(*(np.roll(w[:, :2], -1, axis=0) - w[:, :2]).T)
+                    dt = seg / np.maximum(0.5 * (w[:, 3] + np.roll(w[:, 3], -1)), 1e-3)
+                    return np.r_[0.0, np.cumsum(dt)[:-1]], float(dt.sum())
+                (t_att, T_att), (t_def, T_def) = lap_clock(self.h2h_attack_wps), lap_clock(def_wps)
+                self.h2h_sb_model = dict(d_att=d_att, d_def=d_def, v_att=self.h2h_attack_wps[:, 3].copy(),
+                                         v_def=def_wps[:, 3], t_att=t_att, t_def=t_def, T_att=T_att, T_def=T_def)
                 only = [c for c in str(gp('h2h_sb_corners')).split(',') if c]
                 sb_corners = [c for c in ls['corners'] if not only or c['name'] in only]
+                weak = [c for c in sb_corners if c.get('gain_m', np.inf) < float(gp('h2h_sb_min_gain'))]
+                sb_corners = [c for c in sb_corners if c not in weak]
                 self.get_logger().info(
-                    f'switchback: {gp("h2h_lines")}, {len(sb_corners)} corners '
+                    f'switchback: {gp("h2h_lines")}, {len(sb_corners)} corners armed '
                     f'({", ".join("%s apex %.1f m" % (c["name"], c["s_apex"]) for c in sb_corners)}), '
-                    f'late-apex line up to {np.abs(d_att).max():.2f} m from the raceline')
+                    f'late-apex line up to {np.abs(d_att).max():.2f} m from the raceline'
+                    + (f'; not armed, predicted gain under {float(gp("h2h_sb_min_gain")):.1f} m: '
+                       + ', '.join('%s (%+.1f m)' % (c['name'], c['gain_m']) for c in weak) if weak else ''))
             self.h2h_tac = h2h_lib.Tactician(self.h2h_frame, lat_sep=float(gp('h2h_lat_sep')),
                                              corners=sb_corners, sb_inside=float(gp('h2h_sb_inside')),
                                              sb_max_gap=float(gp('h2h_sb_max_gap')), sb_speed=float(gp('h2h_sb_speed')),
@@ -1396,6 +1500,7 @@ class MPPI(Node):
                                              follow_decel=float(gp('h2h_follow_decel')), a_lat=float(opts['a_lat']),
                                              grip_use=float(gp('h2h_grip_use')), pass_wait=float(gp('h2h_pass_wait')),
                                              react_time=float(gp('h2h_react_time')))
+            self.h2h_tac.sb_model = self.h2h_sb_model if gp('h2h_sb_model') else None
             self.h2h_seq = -1       # scan the tracker was last updated with
             self.h2h_t = None       # its time
             self.h2h_pose_lag = float(gp('h2h_pose_lag'))
@@ -1408,7 +1513,7 @@ class MPPI(Node):
             if gp('h2h_log'):
                 self.h2h_log = open(gp('h2h_log'), 'w')
                 self.h2h_log.write('t,state,side,s_e,d_e,v_e,gap,d_opp,v_opp,v_cap,d_pass,n_moving,a_cmd,steer_cmd,dt_trk,'
-                                   'f_slow,v_ref0,v_refH\n')
+                                   'f_slow,v_ref0,v_refH,f_obs,narrow_d\n')
             self.get_logger().info(f'head-to-head ON: waiting for {gp("h2h_map_topic")}; '
                                    f'pass {"on" if gp("h2h_pass") else "off"}, '
                                    f'opp radius {cfg.OPP_RADIUS} / margin {cfg.OPP_MARGIN} m')
@@ -1484,17 +1589,42 @@ class MPPI(Node):
             # predicted heading errors of 30+ deg whenever the steering changed (closed-loop sim)
             hist = list(self.cmd_hist) if self.get_parameter('latency_history').value else []
             now = time.monotonic()
+
+            def cmd_at(tau, last=(0.0, 0.0)):
+                for t_cmd, a_c, d_c in hist:   # the newest command sent by tau
+                    if t_cmd > tau:
+                        break
+                    last = (a_c, d_c)
+                return last
+
+            # added (steer_rate): the wheels do not jump to a commanded angle, they turn there at
+            # steer_rate at most. Predicting with the commanded angles turned the car further
+            # than it really turns during the delay: MPPI planned from a pose that was already
+            # into the corner, steered less, and the real car turned in late and ran 0.4-0.6 m
+            # wide at every corner (8.6 s per lap instead of 7.8 with the car's delays; and the
+            # longer the compensation, the worse). So: follow the angle the wheels really have.
+            rate = float(self.get_parameter('steer_rate').value) if hist else 0.0
+            if rate > 0.0:
+                if self.steer_act is None:
+                    self.steer_act, self.steer_act_t = cmd_at(now - lat)[1], now
+                tt = self.steer_act_t          # bring it up to now with what reached the car since
+                while tt < now - 1e-6:
+                    dt_s = min(0.01, now - tt)
+                    d_c = cmd_at(tt - lat, (0.0, self.steer_act))[1]
+                    self.steer_act += float(np.clip(d_c - self.steer_act, -rate * dt_s, rate * dt_s))
+                    tt += dt_s
+                self.steer_act_t = now
+            d_act = self.steer_act
             for j in range(n_sub):
                 if hist:
-                    tau = now - lat + j * h   # the command active then: the newest one sent by tau
-                    a_prev, d_prev = 0.0, 0.0
-                    for t_cmd, a_c, d_c in hist:
-                        if t_cmd > tau:
-                            break
-                        a_prev, d_prev = a_c, d_c
+                    a_prev, d_prev = cmd_at(now - lat + j * h)   # the command active then
+                if rate > 0.0:
+                    d_act += float(np.clip(d_prev - d_act, -rate * h, rate * h))
+                    d_prev = d_act
                 x0 = x0 + h * np.array([x0[3] * np.cos(x0[2]), x0[3] * np.sin(x0[2]),
                                         x0[3] * np.tan(d_prev) / cfg.WB, a_prev])
             x0[3] = float(np.clip(x0[3], cfg.MIN_SPEED, cfg.MAX_SPEED))
+        v_plan = float(x0[3])   # the speed when the command of this step takes effect
 
         # TODO: Calculate the reference trajectory for the next H steps
         #       with the current vehicle state.
@@ -1508,9 +1638,16 @@ class MPPI(Node):
         # added (head-to-head): track the other cars, take the moving ones out of the scan (the static
         # obstacle code below then does not brake or detour for them), follow or pass the one ahead
         opp_pred, wps_h2h, v_cap = None, None, np.inf
+        if self.avoid and scan is None:
+            # Avoidance is on and there is no scan yet: do not drive blind. (In the simulator the
+            # first scan sometimes comes a second after the first pose: the car set off without
+            # it and ran into the car parked in front of it.)
+            v_cap = 0.0
         if self.h2h and scan is not None:
             t_pose = odom_msg.header.stamp.sec + 1e-9 * odom_msg.header.stamp.nanosec
             scan, opp_pred, v_cap, wps_h2h = self.h2h_step(scan, p.x, p.y, yaw, v, t_pose, lat)
+        if time.time() < self.start_time:
+            v_cap = 0.0
         if scan is not None and self.get_parameter('slow_near_obstacles').value:
             r_slow = scan[0]
             if self.h2h_frame is not None and self.h2h_frame.wall_dist is not None \
@@ -1530,6 +1667,7 @@ class MPPI(Node):
                                            front_free=float(self.get_parameter('slow_front_free').value),
                                            side_stop=float(self.get_parameter('slow_side_stop').value),
                                            side_free=float(self.get_parameter('slow_side_free').value))
+        f_obs = f_slow   # for the h2h log: the part from returns near the car
         if scan is not None and not self.bend_ok and self.get_parameter('bend_fail_slow').value:
             # added: the last detour plan found no free, drivable line -> slow down early
             f_slow = min(f_slow, float(self.get_parameter('slow_min_factor').value))
@@ -1550,7 +1688,8 @@ class MPPI(Node):
         # still lets the reference speed up further ahead, where the profile is faster
         ref = self.calc_ref_trajectory(x0, wps[:, 0], wps[:, 1], wps[:, 2],
                                        np.minimum(wps[:, 3] * f_slow, v_cap))
-        self.h2h_dbg = (f_slow, float(np.asarray(ref)[1, 3]), float(np.asarray(ref)[-1, 3]))  # for the h2h log
+        self.h2h_dbg = (f_slow, float(np.asarray(ref)[1, 3]), float(np.asarray(ref)[-1, 3]), f_obs,
+                        -1.0 if self.narrow_d is None else self.narrow_d)  # for the h2h log
         t_b = time.perf_counter()
 
         # TODO: warm start: the first input of self.U was applied at the last
@@ -1615,7 +1754,12 @@ class MPPI(Node):
         t_o = time.perf_counter()
         # TODO: run MPPI, keep the new mean control sequence in self.U
         # From a cold start (U = 0) a single update is noisy, so iterate a few times
-        n_iter = cfg.N_ITER_COLD if self.cold else cfg.N_ITER
+        was_cold = self.cold
+        # warm_iters: MPPI updates per control step. One update per step is one improvement of
+        # the plan per step: at the simulator's 166 steps per second the plan is refined 166 times
+        # a second, at the car's 22 only 22 times, and the same controller is 0.65 s per lap
+        # slower on the same track with no delay at all (it turns in late and runs wide).
+        n_iter = cfg.N_ITER_COLD if self.cold else max(cfg.N_ITER, int(self.get_parameter('warm_iters').value))
         if self.cold:  # added: fewer cold-start iterations on a slow computer (car)
             n_iter = min(n_iter, int(self.get_parameter('cold_iters').value))
         self.cold = False
@@ -1650,30 +1794,62 @@ class MPPI(Node):
         drive.header.frame_id = 'ego_racecar/base_link' if self.use_sim else 'base_link'
         drive.drive.steering_angle = delta0
         lead = float(self.get_parameter('accel_lead_time' if a0 > 0.0 else 'brake_lead_time').value)
-        drive.drive.speed = float(np.clip(v + a0 * lead, cfg.MIN_SPEED, cfg.MAX_SPEED))
+        # speed_cmd_predicted: v + a0 * lead from the speed the car WILL have when the command
+        # arrives (the latency-compensated one the plan starts from), not the one measured now.
+        # With 0.19 s of delay and the measured speed, a command sent while accelerating at
+        # 2.5 m/s^2 is 0.5 m/s old on arrival: it asked for about the speed the car had by then,
+        # and the car accelerated at half of what MPPI planned (1.3 instead of 2.4 m/s^2 in the
+        # simulator: 0.4 s per lap on the two straights).
+        v_cmd = v_plan if self.get_parameter('speed_cmd_predicted').value else v
+        drive.drive.speed = float(np.clip(v_cmd + a0 * lead, cfg.MIN_SPEED, cfg.MAX_SPEED))
         # added: stuck recovery. MPPI only drives forward, so in a spot where every forward
-        # trajectory collides (e.g. pointing at an obstacle in a tight turn) it just stops.
-        # After stuck_time s standing still, back up for reverse_time s with the steering
-        # opposite to what MPPI wants: reversing that way turns the nose toward the way out.
+        # trajectory collides (stopped with the nose at a wall after a swerve, or behind an
+        # obstacle in a tight turn) it brakes and stays there for good: twice in the head-to-head
+        # tests, for the rest of the run. After stuck_time s standing still although the reference
+        # wants to move, back up for reverse_time s, steering so that the nose turns back to the
+        # direction of the track (backing up with the wheels to the left turns the nose to the
+        # right). The first version steered "opposite to what MPPI wants", but a planner whose
+        # every trajectory collides wants nothing in particular, and it backed up into the wall.
         if self.avoid and self.get_parameter('recovery').value:
             if self.recover_until is not None and t < self.recover_until:
-                drive.drive.speed = float(self.get_parameter('reverse_speed').value)
-                drive.drive.steering_angle = self.recover_steer
+                i_near = int(np.argmin(np.hypot(self.waypoints[:, 0] - p.x, self.waypoints[:, 1] - p.y)))
+                err = float(np.arctan2(np.sin(yaw - self.waypoints[i_near, 2]), np.cos(yaw - self.waypoints[i_near, 2])))
+                # what is behind the car (the laser does not see there): the map, where there is one
+                frame = self.h2h_frame
+                rear = np.inf if frame is None or frame.wall_dist is None else float(frame.clearance(
+                    p.x - 0.35 * np.cos(yaw), p.y - 0.35 * np.sin(yaw)))
+                if (self.recover_steer != 0.0 and abs(err) < 0.2) or rear < 0.2:
+                    self.recover_until = t      # the nose points down the track again, or a wall is behind
+                else:
+                    drive.drive.speed = float(self.get_parameter('reverse_speed').value)
+                    drive.drive.steering_angle = self.recover_steer
             else:
                 if self.recover_until is not None:  # recovery just ended: plan from scratch
                     self.recover_until = None
                     self.U = jnp.zeros((cfg.H, cfg.NU))
                     self.cold = True
-                if abs(v) < 0.05 and float(ref[0, 3]) > 0.1:
-                    if self.stuck_since is None:
-                        self.stuck_since = t
-                    elif t - self.stuck_since > float(self.get_parameter('stuck_time').value):
-                        self.recover_until = t + float(self.get_parameter('reverse_time').value)
-                        self.recover_steer = cfg.MIN_STEER if delta0 >= 0.0 else cfg.MAX_STEER
-                        self.stuck_since = None
-                        self.get_logger().warn('stuck -> backing up')
+                # Stuck = the reference wants to move and the car has not come 0.15 m in stuck_time
+                # s. (Not "the speed is zero": against a wall with the car's delays the speed
+                # twitches as it pushes on, 21 contacts in 12 s, and the timer never ran out.)
+                moved = self.stuck_at is None or np.hypot(p.x - self.stuck_at[0], p.y - self.stuck_at[1]) > 0.15
+                if float(ref[0, 3]) > 0.3 and not moved:
+                    if t - self.stuck_since > float(self.get_parameter('stuck_time').value):
+                        i_near = int(np.argmin(np.hypot(self.waypoints[:, 0] - p.x, self.waypoints[:, 1] - p.y)))
+                        err = float(np.arctan2(np.sin(yaw - self.waypoints[i_near, 2]),
+                                               np.cos(yaw - self.waypoints[i_near, 2])))  # + = nose to the left
+                        # nose off to the left: wheels left (backing up then turns it right), and
+                        # the other way round; nearly straight: back up straight
+                        # (straight below 0.25 rad: a steered reverse ends as soon as the nose is
+                        # within 0.2 rad, so one started at 0.15 rad ended at once, again and again)
+                        self.recover_steer = 0.0 if abs(err) < 0.25 else (cfg.MAX_STEER if err > 0.0 else cfg.MIN_STEER)
+                        # the further off, the longer (0.6 m/s with full lock turns about 0.6 rad/s)
+                        self.recover_until = t + float(np.clip(abs(err) / 0.6, 1.0, 2.5)) \
+                            * float(self.get_parameter('reverse_time').value)
+                        self.stuck_at = None
+                        self.get_logger().warn(f'stuck (nose {np.degrees(err):+.0f} deg off the track direction) '
+                                               f'-> backing up for {self.recover_until - t:.1f} s')
                 else:
-                    self.stuck_since = None
+                    self.stuck_at, self.stuck_since = (p.x, p.y), t   # moved on, or standing on purpose
         self.drive_pub.publish(drive)
         self.last_cmd = (a0, delta0)
         self.cmd_hist.append((time.monotonic(), a0, delta0))
@@ -1681,7 +1857,7 @@ class MPPI(Node):
 
         # odom stamp age at publish time (includes the particle filter's delay)
         age = self.get_clock().now().nanoseconds * 1e-9 - t
-        if n_iter == 1:  # cold-start solves are logged on their own, not mixed into the stats
+        if not was_cold:  # cold-start solves are logged on their own, not mixed into the stats
             for k, val in zip(self.seg, (t_a - t_start, t_b - t_a, t_c - t_b, t_o - t_c,
                                          t_d - t_o, t_e - t_d, age)):
                 self.seg[k].append(val)
@@ -1690,7 +1866,7 @@ class MPPI(Node):
 
         # timing (EMA) for latency compensation + a log line every 2 s
         dt_step = time.perf_counter() - t_start
-        if n_iter == 1:  # cold starts run several iterations: not representative of the delay
+        if not was_cold:  # cold starts run several iterations: not representative of the delay
             self.comp_time = dt_step if self.comp_time == 0.0 else 0.9 * self.comp_time + 0.1 * dt_step
         if t_start - self.last_log > 2.0:
             self.last_log = t_start
@@ -1738,11 +1914,28 @@ class MPPI(Node):
                                                         self.prev_bend)
         self.prev_bend = (i0, o_path)
         clearance = float(gp('narrow_clearance'))
-        self.narrow_d = narrow_gap_ahead(path, o_path, obs, cfg, clearance)[0] if clearance > 0.0 else None
+        frame = self.h2h_frame
+        map_clear = frame.clearance if (frame is not None and frame.wall_dist is not None
+                                        and gp('slow_ignore_walls')) else None
+        self.narrow_d = narrow_gap_ahead(path, o_path, obs, cfg, clearance, map_clear=map_clear)[0] \
+            if clearance > 0.0 else None
         out = bend_reference(ref, path, o_path)
         self.last_bent_path = np.c_[path[:, 0] - o_path * np.sin(path[:, 2]),
                                     path[:, 1] + o_path * np.cos(path[:, 2])]
         return out
+
+    def restart_callback(self, msg):
+        """added: the simulator has put the cars back on their start poses: stand until the given
+        time (+ start_offset) and forget what was seen and decided before the jump"""
+        self.start_time = float(msg.data) + float(self.get_parameter('start_offset').value)
+        self.U = jnp.zeros((self.config.H, self.config.NU))
+        self.cold = True
+        if self.h2h:
+            tac = self.h2h_tac
+            self.h2h_tracker.tracks = []
+            tac.state, tac.side, tac.target, tac.corner, tac.sb_exit = tac.FREE, 0, None, None, False
+            self.h2h_merge = False
+            self.pose_buf.clear()
 
     def h2h_map_callback(self, msg):
         """added (head-to-head): the static map -> wall distances and the free width beside the raceline"""
@@ -1772,6 +1965,10 @@ class MPPI(Node):
                 self.h2h_warn_t = now
                 self.get_logger().warn(f'head-to-head: no map on {self.get_parameter("h2h_map_topic").value} yet, holding')
             return scan, None, 0.0, None
+        if self.h2h_go_t is None:
+            self.h2h_go_t = time.monotonic() + float(self.get_parameter('h2h_start_hold').value)
+        if time.monotonic() < self.h2h_go_t:
+            return scan, None, 0.0, None   # simulator: until the other cars' controllers are up too
         ranges, angles, range_min = scan
         lx, ly = px + self.lidar_offset * np.cos(yaw), py + self.lidar_offset * np.sin(yaw)
         t_now = t_pose - self.h2h_pose_lag   # the time this pose is really from
@@ -1781,7 +1978,7 @@ class MPPI(Node):
             # look the ego's pose up at the time of the scan (not the newest pose)
             self.h2h_seq, self.h2h_t = self.scan_seq, self.scan_stamp
             sx, sy, syaw = self.pose_at(self.scan_stamp)
-            self.h2h_scan_pose = (sx, sy)
+            self.h2h_scan_pose = (sx, sy, syaw)
             self.h2h_tracker.update(ranges, angles, sx + self.lidar_offset * np.cos(syaw),
                                     sy + self.lidar_offset * np.sin(syaw), syaw, self.scan_stamp)
         # the tracks are from the scan's time: bring their station up to the pose's time
@@ -1799,9 +1996,25 @@ class MPPI(Node):
         tac.step(s_e, d_e, v, moving, t_pose)
         if tac.changed:
             self.get_logger().info(f'h2h -> {tac.state} {tac.info}')
-        # the scan is drawn from the newest pose below (as the static obstacle code does), which
-        # moves everything in it by the ego's motion since the scan: the mask moves with it
-        shift = (px - self.h2h_scan_pose[0], py - self.h2h_scan_pose[1])
+        # The scan is older than the pose (up to 0.09 s with the car's 15 Hz laser: 0.35 m at
+        # 4 m/s), and everything below draws it from the newest pose. Uncorrected, every wall the
+        # car drives towards is drawn that much closer than it is: the car slowed for corners
+        # early ("obstacle ahead": the returns were not on the map's walls any more) and stayed
+        # off the walls on the wrong side of the raceline, 0.9 s per lap in the simulator with
+        # the car's delays. So: where the returns ARE (from the pose the scan was taken at), seen
+        # from the pose of now.
+        if self.get_parameter('h2h_scan_motion').value:
+            sx, sy, syaw = self.h2h_scan_pose
+            ok = np.isfinite(ranges) & (ranges > max(range_min, 0.1))   # not the car's own ~0 m returns
+            r0 = np.where(ok, ranges, 0.0)
+            wx = sx + self.lidar_offset * np.cos(syaw) + r0 * np.cos(syaw + angles) - lx
+            wy = sy + self.lidar_offset * np.sin(syaw) + r0 * np.sin(syaw + angles) - ly
+            ranges = np.where(ok, np.hypot(wx, wy), ranges)
+            a_now = np.arctan2(wy, wx) - yaw
+            angles = np.where(ok, np.arctan2(np.sin(a_now), np.cos(a_now)), angles)
+            shift = (0.0, 0.0)
+        else:
+            shift = (px - self.h2h_scan_pose[0], py - self.h2h_scan_pose[1])
         masked = h2h_lib.OpponentTracker.mask_scan(ranges, angles, lx, ly, yaw, moving, shift=shift)
         # the plan starts `lat` s after the pose (latency compensation): so do the predictions
         # (tried and removed: phantom copies beside a followed car, to make it "as wide as the track".
@@ -1819,33 +2032,57 @@ class MPPI(Node):
             hold = {id(tac.target): -tac.side * (float(self.get_parameter('h2h_claim_room').value)
                                                  if tac.claim_ahead else 0.0)}
         close = None
-        if tac.state == tac.PASS and tac.target is not None:
+        if tac.state in (tac.PASS, tac.SWITCHBACK) and tac.target is not None:
             close = {id(tac.target): min(float(self.get_parameter('h2h_pass_margin').value), cfg.OPP_MARGIN)}
         # Cars that stand still get their body in the cost too (nearest first, after the moving
         # ones). In the scan a car is only its rear box: the static obstacle code steers around a
         # 12 cm box, and scraped along the 58 x 31 cm car in front of it (an opponent that was
         # late off the start line, twice).
         cars = moving
+        v_stand = np.inf
         if self.get_parameter('h2h_standing_cars').value:
             standing = sorted((tr for tr in tracks if not tr.moving and np.hypot(tr.c[0] - cx, tr.c[1] - cy) < 6.0),
                               key=lambda tr: np.hypot(tr.c[0] - cx, tr.c[1] - cy))
             cars = (moving + standing)[:cfg.OPP_MAX]
+            # Come up to a car that stands on the track no faster than the ego can still brake,
+            # down to h2h_standing_speed next to it: it may move off. (An opponent that started
+            # late was reached at 3.9 m/s just as it pulled away, along the line the ego had
+            # planned around it.)
+            v_by = float(self.get_parameter('h2h_standing_speed').value)
+            decel = float(self.get_parameter('h2h_follow_decel').value)
+            for tr in standing:
+                g = float(frame.wrap(tr.s - s_e))
+                if -0.3 < g < 6.0 and abs(tr.d - d_e) < 1.0:
+                    v_stand = min(v_stand, float(np.sqrt(v_by ** 2 + 2.0 * decel * max(g - 1.2, 0.0))))
         opp = h2h_lib.predict_opponents(frame, cars, t_ahead, cfg.OPP_MAX, hold=hold,
                                         margin=cfg.OPP_MARGIN, margins=close)
+        sd = tac.sb_predict(t_ahead)
+        if sd is not None and tac.target in cars[:cfg.OPP_MAX]:
+            k = cars.index(tac.target)
+            opp[k, :, 0], opp[k, :, 1], opp[k, :, 2] = frame.pose(sd[0], sd[1])
         wps = None
         if tac.state == tac.SWITCHBACK:
             wps = self.h2h_attack_wps   # index-aligned with the raceline: just another line
+            o = tac.sb_offsets(self.h2h_attack_d, s_e, d_e, v)
+            if o is not None:
+                # the cut-back: the late-apex line, further in where the defender is next to it
+                wps = self.waypoints.copy()
+                wps[:, 0] -= o * np.sin(wps[:, 2])
+                wps[:, 1] += o * np.cos(wps[:, 2])
+                wps[:, 2] = np.arctan2(np.roll(wps[:, 1], -1) - np.roll(wps[:, 1], 1),
+                                       np.roll(wps[:, 0], -1) - np.roll(wps[:, 0], 1))
+                wps[:, 3] = cfg.MAX_SPEED   # its own corner speeds (below), not the raceline's
         elif tac.state == tac.PASS:
             # the raceline shifted sideways around where the opponent will be when the ego gets there
             s_wp = np.arange(frame.n) * frame.ds
             ahead = frame.wrap(s_wp - s_e)
-            o = tac.ref_offsets(s_wp, np.maximum(ahead, 0.0) / max(v, 1.0))
+            o = tac.ref_offsets(s_wp, np.maximum(ahead, 0.0) / max(v, 1.0), v=v)
             # leave the ego's own sideways position at 0.2 m per m at most: a line that jumps
             # sideways under the car makes MPPI brake instead of steer (and 0.35 m per m at
             # 3.5 m/s is 1.2 m/s sideways, more than the tires hold while accelerating).
             # Measured from where the car is (not from the raceline), so a line that changes
             # sides crosses over at the same rate; then inside the track again at every station.
-            o = tac.shape(o, s_e, d_e)
+            o = tac.shape(o, s_e, d_e, v=v)
             wps = self.waypoints.copy()
             wps[:, 0] -= o * np.sin(wps[:, 2])
             wps[:, 1] += o * np.cos(wps[:, 2])
@@ -1865,8 +2102,13 @@ class MPPI(Node):
                 # tac.hold: dropping back next to a car after a pass that was given up. Stay on
                 # this side until behind it; merging at once steers into its tail.
                 hold = tac.hold or 0.0
-                o = d_e * (1.0 - h2h_lib._smoothstep(np.clip(ahead - hold, 0.0, None) / length)) \
-                    * (ahead > -1.0) * (ahead < length + hold)
+                o = d_e * (1.0 - h2h_lib._smoothstep(np.clip(ahead - hold, 0.0, None) / length))
+                # Behind the car: its own position for 2 m, then back to the raceline over 3 m.
+                # (It used to drop to the raceline 1 m behind the car: what is behind is not
+                # driven, but that step is a hairpin to the speed profile, v_min there, and with
+                # the acceleration limit forward from it 2.8 m/s where the car is. Every merge
+                # after a pass or a switchback was driven at 3 m/s down a 4 m/s straight.)
+                o = np.where(ahead < 0.0, d_e * (1.0 - h2h_lib._smoothstep((-ahead - 2.0) / 3.0)), o)
                 o = tac.clamp(o)
                 wps = self.waypoints.copy()
                 wps[:, 0] -= o * np.sin(wps[:, 2])
@@ -1885,12 +2127,12 @@ class MPPI(Node):
                 f'{t_pose:.3f},{tac.state},{tac.side},{s_e:.2f},{d_e:.2f},{v:.2f},{tac.gap:.2f},'
                 f'{tr.d if tr else np.nan:.2f},{tr.vs if tr else np.nan:.2f},{tac.v_cap:.2f},'
                 f'{tac.d_pass:.2f},{len(moving)},{self.last_cmd[0]:.2f},{self.last_cmd[1]:.3f},{dt_trk:.3f},'
-                + '{:.2f},{:.2f},{:.2f}\n'.format(*getattr(self, 'h2h_dbg', (1.0, 0.0, 0.0))))  # of the last step
+                + '{:.2f},{:.2f},{:.2f},{:.2f},{:.2f}\n'.format(*getattr(self, 'h2h_dbg', (1.0, 0.0, 0.0, 1.0, -1.0))))  # of the last step
         now = time.monotonic()
         if now - self.h2h_pub_t > 0.05:  # 20 Hz: markers for the viewer, the nearest car as odometry
             self.h2h_pub_t = now
             self.h2h_publish(tracks, moving, wps)
-        return (masked, angles, range_min), opp, tac.v_cap, wps
+        return (masked, angles, range_min), opp, min(tac.v_cap, v_stand), wps
 
     def h2h_publish(self, tracks, moving, wps):
         stamp = self.get_clock().now().to_msg()

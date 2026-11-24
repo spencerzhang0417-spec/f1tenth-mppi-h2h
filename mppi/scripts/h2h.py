@@ -271,7 +271,7 @@ class Tactician:
     def __init__(self, frame, lat_sep=0.7, min_lat_sep=0.5, wall_margin=0.12, pass_kappa=0.4,
                  min_dv=0.4, look=4.0, follow_gap=0.3, follow_time=0.2, follow_gain=1.5,
                  pass_timeout=8.0, cooldown=1.5, overlap_gap=0.8, clear_ahead=0.6, max_pass_time=5.0,
-                 move_kappa=0.6, ego_accel=1.3, follow_decel=1.0, react_time=0.35, follow_step=0.3,
+                 move_kappa=0.6, ego_accel=1.8, follow_decel=1.0, react_time=0.35, follow_step=0.3,
                  corners=(), sb_inside=0.2, sb_max_gap=3.0, sb_speed=0.8, sb_give_up=0.15,
                  sb_commit=False, claim=True, claim_dv=0.2, pass_min_time=0.8, brake_look=2.5,
                  pass_look=3.5, pass_path_kappa=0.35, beside_sep=0.36, drop_dv=0.5, drop_rate=1.2,
@@ -308,6 +308,13 @@ class Tactician:
         self.claim_gap = 0.3   # [m] center gap at which the ego counts as next to the car
         self.switched = False  # this pass has changed sides once already
         self.corner = None     # the corner of the running switchback
+        self.sb_exit = False   # ... and the ego has cut back to the inside of the defender
+        # the two lines of the switchback as the line model drives them (set by the node): offsets
+        # d_att / d_def, the defender's speeds v_def and the attacker's v_att, the time at which
+        # each waypoint is reached t_att / t_def and the lap times T_att / T_def. None: no model.
+        self.sb_model = None
+        self.sb_ahead = False  # the ego will be at the crossing of the lines before the defender
+        self.sb_lead = np.nan  # ... by this much [m] (the model's prediction, < 0: after it)
         self.sb_count = 0      # switchbacks started / given up before the turn-in
         self.sb_aborted = 0
         self.state, self.side, self.target = self.FREE, 0, None
@@ -360,7 +367,7 @@ class Tactician:
             # came out 10 % low, and the pass was planned against a slower car than it met)
             r = float(np.clip(best.vs / max(f.wps[int(best.s / f.ds) % f.n, 3], 0.5), 0.3, 1.2))
             self.pace = r if self.pace is None else self.pace + dt / (2.0 + dt) * (r - self.pace)
-        if self._switchback(s_e, v_e, best, best_gap, t):
+        if self._switchback(s_e, d_e, v_e, best, best_gap, t):
             return
         if best is None:
             self._set(self.FREE, 0, None, t, '')
@@ -387,9 +394,15 @@ class Tactician:
         # accelerating all the way), for `span` m of its path. On a straight the raceline crosses
         # from one wall to the other, so each side is open only for a part of it: look for the
         # first stretch that is long enough (the ego can wait behind the car for it), on either side.
-        t_a = min(self._time_to_gain(gap - self.overlap_gap, v_e, v_o, v_free), 8.0)
+        # Before the ego gains anything it has to react and to get out from behind the car (in
+        # line it may not close in faster than it can brake). Without this time in the plan, a
+        # pass with the car's delays was 0.7 s later than planned: its nose got in front 1 m
+        # after the room on its side had ended, between the other car and the wall, and it
+        # scraped the wall.
+        t_out = self.react_time + max(self.beside_sep - abs(d_e - tr.d), 0.0) / 0.6 if gap > self.overlap_gap else 0.0
+        t_a = min(t_out + self._time_to_gain(gap - self.overlap_gap, v_e, v_o, v_free), 8.0)
         running = self.state == self.PASS and tr is self.target
-        t_b = self._time_to_gain(gap - self.beside_gap, v_e, v_o, v_free)
+        t_b = t_out + self._time_to_gain(gap - self.beside_gap, v_e, v_o, v_free)
         s_a = tr.s + v_o * t_a - 0.6
         span = v_o * (min(t_b, 8.0) - t_a) + 0.9
         search = self.pass_wait if gap > self.overlap_gap else 0.2   # next to it already: no waiting
@@ -409,13 +422,23 @@ class Tactician:
             win = wins[self.side]
             why = None
             if gap > 0.0 and not young:      # nose ahead: never; just started / switched: not yet
-                if t - self.t_pass > self.pass_timeout or t_b > self.max_pass_time + 1.0:
+                # (next to the car already, overlapping it: nothing to "get alongside" any more.
+                # Out of a switchback the ego is there at the other car's speed; given up, it
+                # dropped back a car length that the corner had just gained it.)
+                beside_now = gap < CAR_LENGTH + 0.3 and abs(d_e - tr.d) >= self.beside_sep
+                if t - self.t_pass > self.pass_timeout or (t_b > self.max_pass_time + 1.0 and not beside_now):
                     why = f'not getting alongside (dv {dv:.1f} m/s)'
+                elif win is not None and gap >= self.overlap_gap \
+                        and not self._can_finish(win, gap, t_a, v_e, v_o, v_free, 1.0, t_out):
+                    why = 'cannot finish before the room ends'
                 elif win is None:
                     other = self._open_stretch(tr, -self.side, s_a, span, need,
                                                self._kappa_limits(self.pace)[-self.side], search)
-                    if gap >= self.overlap_gap and other is not None and not self.switched \
-                            and abs(d_e - tr.d) < self.beside_sep + 0.2:
+                    # (only from right behind the car and with room to cross: changing sides
+                    # from half a meter out, 0.9 m behind it, ended on its rear bumper)
+                    if gap >= self.overlap_gap + 0.4 and other is not None and not self.switched \
+                            and abs(d_e - tr.d) < 0.2 \
+                            and self._can_finish(other, gap, t_a, v_e, v_o, v_free, 0.85, t_out):
                         # (once per pass: left, right, left again is a pass that goes nowhere)
                         self.switched = True
                         # still behind it: cross to the side that is open where the pass will happen
@@ -443,13 +466,19 @@ class Tactician:
                             + max(gap - self.overlap_gap, 0.0) / (win[0] / max(v_o, 0.5))
                 if not self.changed:
                     self.info = f'gap {gap:+.1f} m'
+                if gap >= self.overlap_gap and not self._can_finish(win, gap, t_a, v_e, v_o, v_free, 1.0, t_out):
+                    # (also in the first moments of a pass, when it is not given up yet)
+                    self.v_cap = min(self.v_cap, self.vo_f + float(np.sqrt(
+                        2.0 * self.follow_decel * max(gap - self.overlap_gap - 0.1, 0.0))))
                 if gap > 0.0 and abs(d_e - tr.d) < self.beside_sep:
                     # Still in line behind the car (not out to the side yet, or the wall does not
                     # let it): close in only as fast as the ego can brake again in the gap it
                     # has. Uncapped, it came up to 1 m behind a 0.4x car at +1.3 m/s waiting for
                     # room on a side where the wall was; the room did not come, the pass was
                     # given up, and what was left was full braking and a swerve to the wall.
-                    v_now = min(tr.vs, self.vo_f)
+                    # (the smoothed speed: while the ego pulls out it sees the box from another
+                    # side, and the raw estimate of a car driving 1.8 m/s read 0.9 for a moment)
+                    v_now = self.vo_f
                     self.v_cap = min(self.v_cap, float(np.sqrt(
                         max(v_now, 0.0) ** 2 + 2.0 * self.follow_decel * max(gap - CAR_LENGTH - 0.1, 0.0))))
         else:
@@ -464,6 +493,8 @@ class Tactician:
             over_p = np.abs(f.kappa[idx_p]) >= lim_p
             kap_path = float(np.max(np.abs(f.kappa[idx_p])[over_p])) if over_p.any() else 0.0
             open_sides = [sd for sd in (1, -1) if wins[sd] is not None]
+            unfinished = [sd for sd in open_sides if not self._can_finish(wins[sd], gap, t_a, v_e, v_o, v_free, 0.85, t_out)]
+            open_sides = [sd for sd in open_sides if sd not in unfinished]
             # the side that opens first; if both do, the one that stays open longer (the ego is
             # often later than planned), the inside of the next corner counting 1.5 m more (side
             # by side there, the corner is the ego's)
@@ -477,7 +508,8 @@ class Tactician:
                 why = 'too close'
             elif side == 0:
                 why = 'no stretch (left: {}, right: {})'.format(
-                    *(self._why_closed(tr, sd, s_a, span + slack, need, kaps[sd]) for sd in (1, -1)))
+                    *('too short to finish' if sd in unfinished else
+                      self._why_closed(tr, sd, s_a, span + slack, need, kaps[sd]) for sd in (1, -1)))
             elif kap_e >= lim_e:
                 # the ego itself is still turning: it has no steering left to change lanes
                 # (and a move to the inside of a hairpin is tighter than the car can turn)
@@ -534,10 +566,11 @@ class Tactician:
                 # The cap comes down at drop_rate, from the speed the car has: a cap a fixed step
                 # below the car's own speed is chased by the car at full braking (-2.5 m/s^2).
                 last = self.cap_last if np.isfinite(self.cap_last) else v_e
-                self.v_cap = max(min(v_o - self.drop_dv, v_soft), min(last, v_e) - self.drop_rate * dt, 0.0)
+                rate = self.follow_decel if v_e - tr.vs > 0.8 else self.drop_rate   # still closing fast: not so gently
+                self.v_cap = max(min(v_o - self.drop_dv, v_soft), min(last, v_e) - rate * dt, 0.0)
                 self.hold = max(gap, 0.0) + 1.0
 
-    def _switchback(self, s_e, v_e, tr, gap, t):
+    def _switchback(self, s_e, d_e, v_e, tr, gap, t):
         """the switchback: when the car ahead covers the inside before a corner, take the late-apex
         line through it (wide in, late apex, out on the inside) instead of following it.
         True while it is running: the caller then uses the late-apex line and no speed cap."""
@@ -545,9 +578,20 @@ class Tactician:
         if self.state == self.SWITCHBACK:
             c = self.corner
             zone = (c['s_end'] - c['s_split']) % f.length
-            if float(f.wrap(s_e - c['s_split'])) > zone:        # back on the raceline: done
-                self.corner = None
-                self._set(self.FREE, 0, None, t, f'switchback {c["name"]} finished, gap {gap:+.1f} m')
+            if float(f.wrap(s_e - c['s_split'])) > zone:        # the lines are together again: done
+                self.corner, self.sb_exit = None, False
+                if tr is not None and -2.0 < gap < 1.5 and c['inside'] * (d_e - tr.d) > 0.0:
+                    # Not clear of the car yet (next to it, or its nose just behind): the ego keeps
+                    # its lane on the inside until it is, as a pass on that side. Both lines end
+                    # on the raceline here: handed back to FREE / FOLLOW, the ego steered onto it
+                    # with the other car 0.6 m ahead on the same line, and touched its tail.
+                    self.t_pass = self.t_start = t
+                    self.switched = True
+                    self.d_pass = self._pass_line(tr, c['inside'], self.room(tr, c['inside'], tr.s - 0.3, tr.s + 1.5))
+                    self._set(self.PASS, c['inside'], tr, t,
+                              f'switchback {c["name"]} through, finishing on the inside, gap {gap:+.1f} m')
+                else:
+                    self._set(self.FREE, 0, None, t, f'switchback {c["name"]} finished, gap {gap:+.1f} m')
                 return False
             before_commit = float(f.wrap(s_e - c['s_commit'])) < 0.0
             opp_before_apex = tr is not None and float(f.wrap(tr.s - c['s_apex'])) < -0.5
@@ -564,7 +608,33 @@ class Tactician:
                 self.t_block = t
                 self._set(self.FOLLOW, 0, tr, t, f'switchback {c["name"]} given up: opponent at {tr.d:+.2f} m')
                 return False
-            self.info = f'{c["name"]} gap {gap:+.1f} m'
+            self._sb_timing(c, s_e, d_e, v_e, tr, gap)
+            # the cut-back: past the turn-in and on the inside of the defender, the ego drives
+            # NEXT TO that car (sb_offsets), not along a line that does not know where it is
+            self.sb_exit = (tr is not None and not before_commit and -2.0 < gap < 2.5
+                            and c['inside'] * (d_e - tr.d) > 0.0)
+            clearing = False
+            m = self.sb_model
+            if m is not None and tr is not None:
+                # Crossing behind a car that is on its way to the outside wall: by the time the ego
+                # is where that car is now, it is not there any more. Where both will be 0.4 s on,
+                # each on its line (the line model), if the car ahead is driving its line.
+                io, ie = int(tr.s / f.ds) % f.n, int(s_e / f.ds) % f.n
+                err = tr.d - float(m['d_def'][io])
+                if abs(err) < 0.4:
+                    d_o = float(m['d_def'][int((tr.s + 0.4 * max(tr.vs, 0.0)) / f.ds) % f.n]) + err
+                    d_a = float(m['d_att'][int((s_e + 0.4 * max(v_e, 0.0)) / f.ds) % f.n]) + d_e - float(m['d_att'][ie])
+                    clearing = c['inside'] * (d_a - d_o) > self.beside_sep + 0.15
+            if tr is not None and gap > 0.0 and abs(d_e - tr.d) < self.beside_sep and not clearing:
+                # In line behind it (crossing its track from the outside to the inside, or no room
+                # to get next to it): close in only as fast as the ego can still brake. An early
+                # apex ends in a slow exit; the ego came out of the corner 1.4 m/s faster than
+                # the car in front of it.
+                v_now = max(min(tr.vs, self.vo_f), 0.0)
+                self.v_cap = min(self.v_cap, float(np.sqrt(
+                    v_now ** 2 + 2.0 * self.follow_decel * max(gap - CAR_LENGTH - 0.1, 0.0))))
+            self.info = f'{c["name"]} gap {gap:+.1f} m' + ('' if np.isnan(self.sb_lead) else
+                                                          f', at the crossing {self.sb_lead:+.1f} m')
             return True
         if tr is None or not self.corners:
             return False
@@ -584,12 +654,116 @@ class Tactician:
             if 0.3 < gap < self.sb_max_gap and inside_now >= self.sb_inside \
                     and v_e >= self.sb_speed * v_line and v_e >= tr.vs - 0.3:
                 self.corner = c
+                self.sb_ahead = False
                 self.sb_count += 1
                 self._set(self.SWITCHBACK, -c['inside'], tr, t,
                           f'{c["name"]}: opponent {c["inside"] * tr.d:+.2f} m inside, gap {gap:+.1f} m, '
                           f'entry speed {v_e:.1f} of {v_line:.1f} m/s')
                 return True
         return False
+
+    def _sb_timing(self, c, s_e, d_e, v_e, tr, gap):
+        """SWITCHBACK before the lines cross: who is at the crossing first?
+
+        The late-apex line is outside of the defender's on the way in and inside of it on the
+        way out, so the two cross once, around the apex. A car that covers the inside brakes
+        early and deep for its tight line; the ego, on the outside, brakes later. Driven flat
+        out, the ego arrives at the crossing next to that car, which is the one place where it
+        must not be: the defender runs wide out of its early apex, onto the line of a car on
+        its outside. So the ego is there either clearly before it (then the corner is the ego's:
+        it has out-braked the other car around the outside) or behind it, to cut back under it.
+        Which one is decided from the line model: both lines' own speed profiles from where
+        the cars are now, the defender's scaled to the pace it is driving at.
+          before it by more than a car:  nothing to do
+          otherwise:                     the late-apex line's speeds scaled down so that the ego
+                                         arrives 0.75 m behind the defender, still faster than it
+                                         (the run it takes onto the inside out of the corner)"""
+        self.sb_lead = np.nan
+        m, f = self.sb_model, self.f
+        if m is None or tr is None or gap < -1.0 or gap > 4.0:
+            return
+        side, n = c['inside'], f.n
+        if 'i_x' not in c:
+            # where the late-apex line gets inside of the defender's
+            idx = (int(c['s_commit'] / f.ds) - 20 + np.arange(int(((c['s_end'] - c['s_commit']) % f.length) / f.ds) + 20)) % n
+            k = np.nonzero(side * (m['d_att'][idx] - m['d_def'][idx]) >= 0.0)[0]
+            c['i_x'] = int(idx[k[0]]) if len(k) else int(c['s_apex'] / f.ds) % n
+        ix, ie, io = c['i_x'], int(s_e / f.ds) % n, int(tr.s / f.ds) % n
+        if float(f.wrap(ix * f.ds - s_e)) <= 0.0 or side * (d_e - tr.d) > 0.0:
+            return                                              # past the crossing, or inside already
+        te = float((m['t_att'][ix] - m['t_att'][ie]) % m['T_att'])
+        te *= float(np.clip(m['v_att'][ie] / max(v_e, 0.5), 1.0, 1.3))   # (slower than the line now: later)
+        if float(f.wrap(ix * f.ds - tr.s)) > 0.0:
+            to = float((m['t_def'][ix] - m['t_def'][io]) % m['T_def'])
+        else:
+            to = -float((m['t_def'][io] - m['t_def'][ix]) % m['T_def'])   # the defender is through
+        to *= float(np.clip(m['v_def'][io] / max(self.vo_f, 0.5), 0.75, 1.4))
+        v_x = float(m['v_def'][ix])
+        self.sb_lead = (to - te) * v_x
+        # (hysteresis: a decision that flips at every step is braking and accelerating in turns)
+        self.sb_ahead = self.sb_lead > (1.0 if self.sb_ahead else 1.5)
+        if not self.sb_ahead:
+            t_need = to + 0.75 / max(v_x, 0.5)
+            scale = float(np.clip(te / max(t_need, 0.05), 0.5, 1.0))
+            self.v_cap = min(self.v_cap, max(float(m['v_att'][ie]) * scale, 0.8 * max(self.vo_f, 0.0)))
+
+    def sb_predict(self, times):
+        """SWITCHBACK: where the defender will be at `times` [s from now] if it drives the
+        defender's line of this corner (the line model), (s, d) arrays; None if it is not on
+        that line (more than 0.5 m off it) or there is no model. Its early apex takes it from
+        the inside wall to the outside one within a second: predicted on the offset it has now,
+        it is in the way of the cut-back and gone by the time the ego gets there."""
+        m, tr, f = self.sb_model, self.target, self.f
+        if self.state != self.SWITCHBACK or m is None or tr is None:
+            return None
+        io = int(tr.s / f.ds) % f.n
+        err = tr.d - float(m['d_def'][io])
+        if abs(err) > 0.5:
+            return None
+        s, d, ratio = np.empty(len(times)), np.empty(len(times)), max(tr.vs, 0.0) / max(float(m['v_def'][io]), 0.5)
+        ratio = float(np.clip(ratio, 0.6, 1.4))
+        s_k, t_k = tr.s, 0.0
+        for k, t in enumerate(times):
+            i = int(s_k / f.ds) % f.n
+            s_k += float(m['v_def'][i]) * ratio * (t - t_k)
+            t_k = t
+            s[k], d[k] = s_k, float(m['d_def'][int(s_k / f.ds) % f.n]) + err
+        return s % f.length, d
+
+    def sb_offsets(self, o_att, s_e, d_e, v):
+        """SWITCHBACK after the turn-in: the late-apex line (o_att, its offsets from the raceline),
+        moved further to the inside where the defender will be when the ego gets there, so that
+        the ego comes out of the corner lat_sep next to that car and not behind it. The late-apex
+        line and the defender's line both end on the raceline; next to each other the cars cannot.
+        None: the late-apex line as it is."""
+        if self.state != self.SWITCHBACK or not self.sb_exit or self.target is None:
+            return None
+        f, side, tr = self.f, self.corner['inside'], self.target
+        s_wp = np.arange(f.n) * f.ds
+        ahead = np.maximum(f.wrap(s_wp - s_e), 0.0)
+        g = f.wrap(s_wp - (tr.s + tr.vs * ahead / max(v, 1.0)))     # station relative to the car, then
+        k = max(1.0, v / 4.0)
+        w = np.where(g < 0.0, _smoothstep((g + 1.2 + 1.8 * k) / (1.8 * k)), 1.0 - _smoothstep((g - 1.6) / (3.0 * k)))
+        # A defender coming back from the outside is moving towards the ego's lane: where will it
+        # be in 0.4 s? On its line (the line model), if it is driving that; else by its sideways
+        # speed now. (By its sideways speed alone, a car returning to the raceline at 1 m/s was
+        # put 0.45 m further in than it ever came, and the ego's lane against the inside wall.)
+        m = self.sb_model
+        io = int(tr.s / f.ds) % f.n
+        if m is not None and abs(tr.d - float(m['d_def'][io])) < 0.5:
+            d_next = float(m['d_def'][int((tr.s + 0.4 * max(tr.vs, 0.0)) / f.ds) % f.n]) + tr.d - float(m['d_def'][io])
+        else:
+            d_next = tr.d + 0.4 * tr.vd
+        # (a car's width and a hand: next to it out of a corner, not lat_sep as on a straight)
+        lane = side * max(side * tr.d, side * d_next) + side * (self.min_lat_sep + 0.05)
+        extra = side * np.maximum(side * (lane - o_att), 0.0) * w
+        if float(np.max(np.abs(extra))) < 0.05:
+            # the line is far enough from the car as it is: drive it as it is (re-shaped from the
+            # car's own position it gets bends of its own, 0.4 m/s out of the corner for nothing)
+            return None
+        # from where the car is relative to the line, sideways no faster than it can follow
+        extra = self.shape(extra, s_e, d_e - o_att[int(s_e / f.ds) % f.n], v=v)
+        return self.clamp(o_att + extra)
 
     def _hold_inside(self, s_e, d_e, v_e, tr, gap, t):
         """right of way: the ego is next to the car (overlapping or ahead), on the inside of the
@@ -657,11 +831,13 @@ class Tactician:
         after it, with `need` m of room on `side` of the car and no corner (|kappa| < kap_max, a
         value per waypoint).
         Returns (how much later than s_from it starts [m], smallest room in it [m], how long
-        the open run goes on from there [m], looking 6 m past the stretch) or None."""
+        the open run goes on from there [m], looking 6 m past the stretch, and whether what ends
+        the run is a corner with `side` as its inside) or None."""
         f = self.f
         idx = f.window(s_from, s_from + search + span + 6.0)
         w = (f.w_left[idx] if side > 0 else f.w_right[idx]) - side * tr.d
-        bad = np.r_[0, np.cumsum((w < need) | (np.abs(f.kappa[idx]) >= kap_max[idx]))]
+        no_room, corner = w < need, np.abs(f.kappa[idx]) >= kap_max[idx]
+        bad = np.r_[0, np.cumsum(no_room | corner)]
         m = min(int(np.ceil(span / f.ds)) + 1, len(idx))
         free = np.nonzero(bad[m:] - bad[:-m] == 0)[0]
         free = free[free * f.ds <= search + 1e-6]
@@ -669,8 +845,24 @@ class Tactician:
             return None
         i = int(free[0])
         end = np.nonzero(bad[i + 1:] > bad[i])[0]              # where the open run ends
-        run = (int(end[0]) if len(end) else len(idx)) * f.ds
-        return i * f.ds, float(np.min(w[i:i + m])), run
+        j = int(end[0]) if len(end) else len(idx)              # first point that is not open
+        inside_end = bool(j < len(idx) and corner[i + j] and not no_room[i + j]
+                          and np.sign(f.kappa[idx[i + j]]) == side)
+        return i * f.ds, float(np.min(w[i:i + m])), j * f.ds if len(end) else 99.0, inside_end
+
+    def _can_finish(self, win, gap, t_a, v_e, v_o, v_free, slack, t_out=0.0):
+        """A pass has to END somewhere safe: can the ego be there before the open stretch (win,
+        of _open_stretch) is over? Safe is: its nose in front of the other car (then the place
+        is taken), or, where the stretch ends at a corner with the ego on the inside, really next
+        to the car (then the corner is the ego's, _hold_inside). Anywhere else next to the car
+        when the room or the straight runs out leaves only full braking and a swerve: that is
+        how the car ended against the wall twice."""
+        if win is None:
+            return False
+        delay, _, run, inside_end = win
+        t_end = t_a + (delay + run - 0.6) / max(v_o, 0.3)          # the opponent at the end of the run
+        g_ok = self.claim_gap - 0.05 if inside_end else -0.3
+        return t_out + self._time_to_gain(gap - g_ok, v_e, v_o, v_free) <= slack * t_end
 
     def _why_closed(self, tr, side, s_from, span, need, kap_max):
         """what is in the way of a pass on `side` over the stretch from s_from: 'room 0.42 m',
@@ -707,7 +899,7 @@ class Tactician:
                         or (state == self.FOLLOW and info.split(' (')[0] != self.info.split(' (')[0]))
         self.state, self.side, self.target, self.info = state, side, target, info
 
-    def ref_offsets(self, s_ref, t_ref):
+    def ref_offsets(self, s_ref, t_ref, v=4.0):
         """sideways shift [m] of reference points at stations s_ref reached after t_ref seconds:
         full shift from 1.2 m behind to 1.2 m ahead of where the opponent will be then, blended
         to the raceline over the 1.8 m before and after"""
@@ -715,10 +907,11 @@ class Tactician:
             return np.zeros(len(s_ref))
         tr = self.target
         g = self.f.wrap(np.asarray(s_ref) - (tr.s + tr.vs * np.asarray(t_ref)))
-        w = np.where(g < 0.0, _smoothstep((g + 3.0) / 1.8), 1.0 - _smoothstep((g - 1.6) / 3.0))
+        k = max(1.0, v / 4.0)      # the blends as long in time at any speed (they were made at 4 m/s)
+        w = np.where(g < 0.0, _smoothstep((g + 1.2 + 1.8 * k) / (1.8 * k)), 1.0 - _smoothstep((g - 1.6) / (3.0 * k)))
         return self.clamp(w * self.d_pass, (np.asarray(s_ref) / self.f.ds).astype(int) % self.f.n)
 
-    def shape(self, o, s_e, d_e, slope=0.2, soften=1.5):
+    def shape(self, o, s_e, d_e, slope=0.2, soften=1.5, v=None):
         """offsets of a passing line (one per waypoint) made drivable at speed: the line leaves
         the car's own sideways position d_e, and moves sideways by at most `slope` m per m in
         either direction -- it starts to come back early enough for where it has to be back (in
@@ -726,6 +919,13 @@ class Tactician:
         `soften` m. The sideways move of 0.6 m used to come back within 1.8 m: a bend of its own
         that the car may take at 2.1 m/s, slower than a 0.7x opponent drives on the straight."""
         f = self.f
+        if v is not None:
+            # about 0.7 m/s sideways: 0.2 m per m at 3.5 m/s (more than that the tires do not hold
+            # while accelerating), up to 0.35 behind a slow car, where 0.2 took 1.3 s to get out
+            # (0.7 m/s sideways at any speed: with 0.2 m per m as the least, the line moved over at
+            # 1.2 m/s at 6 m/s, a bend its own speed profile takes at 4.3 m/s, on a straight)
+            slope = float(np.clip(0.7 / max(v, 0.5), 0.1, 0.35))
+            soften = soften * max(1.0, v / 4.0)
         n, i0 = f.n, int(s_e / f.ds) % f.n
         m = n // 2                                    # the half of the lap ahead of the car
         u = np.roll(np.asarray(o, dtype=float), -i0)[:m]

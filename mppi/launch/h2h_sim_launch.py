@@ -28,6 +28,7 @@ import importlib.util
 import json
 import os
 import tempfile
+import time
 
 import numpy as np
 import yaml
@@ -46,13 +47,22 @@ SIM_OVERRIDES = {
     'odom_topic': '/ego_racecar/odom',
     'drive_topic': '/drive',
     'lidar_offset': 0.275,     # lidar_base_link_to_lidar_tf in sim_race2.yaml
+    'recovery': True,          # back up when stopped at a wall (scripts/stuck_test.py)
+    'yaw_gain': 0.87,          # measured: the simulated car turns 0.87 of the bicycle model's yaw rate in corners
 }
 # pace:=race: the speed profile of the team's final race 2 raceline (scripts/raceline.py) instead of
 # the cautious one of car_launch.py (a_lat 1.69: so slow that the shortest line is the fastest)
 RACE_PACE = {'a_lat': 4.3, 'a_lon': 2.5, 'v_min': 1.0, 'v_max': 4.0, 'max_speed': 5.0,
-             'slow_ignore_walls': True}   # walls are not obstacles to brake for
+             'slow_ignore_walls': True,   # walls are not obstacles to brake for
+             # The obstacle grid from the map + what the scan sees that is not on it, instead of
+             # "what the scan has not seen is blocked". With the latter the track behind every
+             # corner is an obstacle until the car sees it: the detour planner moved the reference
+             # up to 1 m off the raceline and the narrow-gap logic braked for it, on an empty
+             # track (8.65 -> 7.72 s per lap with the car's delays, 7.70 -> 7.41 s without).
+             'use_map_prior': True}
 # latency:=true (default): the controller talks to the simulator through latency_node.py
 DELAYED_TOPICS = {
+    'speed_cmd_predicted': True,   # the speed command from the speed the car will have on arrival
     'odom_topic': '/sim_delayed/odom',
     'scan_topic': '/sim_delayed/scan',
     'drive_topic': '/mppi/drive',
@@ -120,6 +130,8 @@ def _setup(context):
     lc = lambda k: LaunchConfiguration(k).perform(context)
     raceline, pace = lc('raceline'), lc('pace')
     config = os.path.join(share, 'config', 'sim_race2.yaml')
+    # sync_start: every car stands until the same instant, this many seconds from now
+    start_time = time.time() + float(lc('sync_start')) if lc('sync_start') else 0.0
     if lc('start_gap'):
         config = _start_config(share, raceline, float(lc('start_s')), float(lc('start_gap')), n)
 
@@ -128,7 +140,7 @@ def _setup(context):
             get_package_share_directory('f1tenth_gym_ros'), 'launch', 'gym_bridge_launch.py')),
         launch_arguments={
             'config': config,
-            'map_path': os.path.join(share, 'maps', 'race2_map_edited'),
+            'map_path': os.path.join(share, 'maps', lc('map')),
             'num_agents': str(n),
             'open_foxglove': LaunchConfiguration('open_foxglove'),
         }.items())
@@ -145,10 +157,12 @@ def _setup(context):
             # nothing between a command and its effect: the ego can sit closer behind a car
             ego.update({'h2h_follow_decel': 2.0, 'h2h_react_time': 0.1, 'h2h_follow_time': 0.1})
         ego['h2h'] = h2h
+        # the opponent's controller comes up later than the ego's: wait for it (or, with
+        # sync_start, both wait for the same instant)
+        ego['h2h_start_hold'] = 0.0 if start_time else 4.0
+        ego['start_time'] = start_time
         ego['h2h_pass'] = LaunchConfiguration('h2h_pass').perform(context).lower() == 'true'
         ego['h2h_log'] = LaunchConfiguration('h2h_log').perform(context)
-        ego.update(json.loads(lc('car_params') or '{}'))   # both cars
-        ego.update(json.loads(lc('ego_params') or '{}'))   # the ego only
         ego['h2h_lines'] = lc('switchback')
         ego['h2h_sb_corners'] = lc('sb_corners')
         ego['h2h_sb_commit'] = lc('sb_commit') == 'true'
@@ -162,14 +176,19 @@ def _setup(context):
         ego['h2h_box'] = box
         if latency:
             nodes.append(Node(package='mppi', executable='latency_node.py', output='screen',
-                              parameters=[{'scan_in': '/scan_box' if box else '/scan'}]))
+                              parameters=[dict({'scan_in': '/scan_box' if box else '/scan'},
+                                               **json.loads(lc('latency_params') or '{}'))]))
             if LaunchConfiguration('fused_pose').perform(context).lower() == 'true':
                 ego.update(FUSED_POSE)
                 nodes.append(Node(package='mppi', executable='pose_fusion_node.py', output='screen',
-                                  parameters=[FUSION_NODE]))
+                                  parameters=[dict(FUSION_NODE, **json.loads(lc('fusion_params') or '{}'))]))
             else:
                 ego['h2h_pose_lag'] = FUSION_NODE['lag']  # the tracker must know the pose is old
         ego['visualize'] = LaunchConfiguration('visualize').perform(context).lower() == 'true'
+        # last, so they also override what the presets above set (they used to come before
+        # FUSED_POSE: a latency_comp given on the command line was silently replaced by 0.19)
+        ego.update(json.loads(lc('car_params') or '{}'))   # both cars
+        ego.update(json.loads(lc('ego_params') or '{}'))   # the ego only
         nodes.append(Node(package='mppi', executable='mppi_node.py', output='screen',
                           parameters=[ego]))
     for i in range(1, n):
@@ -185,6 +204,11 @@ def _setup(context):
             if pace == 'race':
                 opp.update(RACE_PACE)
             opp.update(json.loads(lc('car_params') or '{}'))
+            if lc('opp_slow_zone'):
+                opp['slow_zone'] = [float(q) for q in lc('opp_slow_zone').split(',')]
+            opp.update({'line_set': lc('opp_line_set'), 'line_key': 'defend', 'line_corners': lc('opp_line_corners'),
+                        'start_time': start_time + float(lc('opp_start_delay')) if start_time else 0.0,
+                        'start_offset': float(lc('opp_start_delay'))})
             opp.update({'waypoint_file': lc('opp_line') or raceline, 'odom_topic': f'/opp_racecar{suffix}/odom',
                         'drive_topic': f'/opp_drive{suffix}', 'scan_topic': f'/opp_scan{suffix}',
                         'h2h': False, 'visualize': False,
@@ -224,6 +248,17 @@ def generate_launch_description():
         DeclareLaunchArgument('start_gap', default_value='',
                               description="[m] line the cars up on the ego's raceline this far apart ('' = poses of the sim config)"),
         DeclareLaunchArgument('start_s', default_value='20.0', description='[m] station of the ego at the start'),
+        DeclareLaunchArgument('map', default_value='race2_map_edited', description='map in mppi/maps (without .yaml)'),
+        DeclareLaunchArgument('sync_start', default_value='',
+                              description="[s] all cars set off together this long after the launch ('' = each when it is up)"),
+        DeclareLaunchArgument('opp_slow_zone', default_value='',
+                              description="'from,to,factor': mppi opponents drive stations from .. to at factor x their speed"),
+        DeclareLaunchArgument('opp_start_delay', default_value='0.0',
+                              description='[s] with sync_start: mppi opponents set off this much later than the ego'),
+        DeclareLaunchArgument('opp_line_set', default_value='',
+                              description="mppi opponents drive the defender's (early-apex) line of this json of make_apex_lines.py"),
+        DeclareLaunchArgument('opp_line_corners', default_value='',
+                              description="... only in these corners, e.g. 'tight_mid' ('' = every corner)"),
         DeclareLaunchArgument('switchback', default_value='',
                               description="late-apex lines json of scripts/make_apex_lines.py ('' = no switchback)"),
         DeclareLaunchArgument('box', default_value='true',
@@ -242,5 +277,9 @@ def generate_launch_description():
         DeclareLaunchArgument('h2h_pass', default_value='true', description='false: follow only'),
         DeclareLaunchArgument('h2h_log', default_value='', description='csv path: one line per control step'),
         DeclareLaunchArgument('open_foxglove', default_value='false'),
+        DeclareLaunchArgument('latency_params', default_value='',
+                              description='json: parameters of latency_node.py, e.g. {"actuation_delay": 0.0}'),
+        DeclareLaunchArgument('fusion_params', default_value='',
+                              description='json: parameters of pose_fusion_node.py, e.g. {"rate": 50.0}'),
         OpaqueFunction(function=_setup),
     ])

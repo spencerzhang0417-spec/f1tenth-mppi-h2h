@@ -76,12 +76,13 @@ def find_corners(kappa, ds, k_min, merge=1.0):
 class Corner:
     """one corner and one kind of line through it: the zone the line may change in and where it
     has to be -- 'late': outside of the raceline until the apex; 'early': inside of it on the way in"""
-    def __init__(self, prob, xy, apex, inside, args, kind):
+    def __init__(self, prob, xy, apex, inside, args, kind, d_def=None):
         self.n, self.ds = len(xy), 0.1
         self.apex, self.inside, self.kind = apex, inside, kind
         self.before = args.before if kind == 'late' else args.early_before
         self.i0 = int(apex - self.before / self.ds) % self.n       # lines split here
-        m = int((self.before + args.after) / self.ds)
+        after = args.after if kind == 'late' else (args.early_after or args.after)
+        m = int((self.before + after) / self.ds)
         self.idx = (self.i0 + np.arange(m + 1)) % self.n            # the zone, in driving order
         self.rel = np.arange(m + 1) * self.ds                       # station from the start of the zone
         to_apex = self.before - self.rel                            # distance still to go to the apex
@@ -101,23 +102,43 @@ class Corner:
 
         self.lo, self.hi = np.full(len(self.idx), -np.inf), np.full(len(self.idx), np.inf)
         if kind == 'late':
-            # wide on the way in: out by apex_room from ramp_from -> ramp_to m before the apex,
-            # released `release` m before it ...
+            # Where the line has to be is given by where the DEFENDER is (d_def, its line): only
+            # as far out as it takes to leave the inside to that car. (It used to be "0.6 m outside
+            # of the raceline": in a wide corner, where the raceline comes in from the outside
+            # anyway and the defender is 1.5 m further in, that was a detour of 0.3 s for nothing.)
+            u_def = inside * np.asarray(d_def)[self.idx]
+            # on the way in: apex_room OUTSIDE of the defender's line, from ramp_from -> ramp_to m
+            # before the apex, released `release` m before it ...
             ramp = np.clip((args.ramp_from - to_apex) / (args.ramp_from - args.ramp_to), 0.0, 1.0)
             m_in = (to_apex <= args.ramp_from) & (to_apex >= args.release)
-            self.hi[m_in] = -np.minimum(args.apex_room * ramp, room(-1))[m_in]
-            # ... and INSIDE of the raceline on the way out, exit_from -> exit_to m past the apex.
-            # Without this the fastest "wide in" line just runs a wide arc around the whole corner
-            # and never comes back to the inside: this is what makes it turn late and hug the
-            # inside wall at a later apex.
-            m_out = (to_apex <= -args.exit_from) & (to_apex >= -args.exit_to)
-            self.lo[m_out] = np.minimum(args.exit_inside, room(+1))[m_out]
+            self.hi[m_in] = np.maximum(u_def - args.apex_room * ramp, -room(-1))[m_in]
+            # ... and on the way out INSIDE of it, from exit_from m past the apex until the lines
+            # are together again (the room tapers off over the last 2 m). This is the cut-back:
+            # the defender runs wide out of its early apex, the attacker turns late and comes out
+            # between it and the inside wall. Without it the fastest "wide in" line runs a wide
+            # arc around the whole corner, into the car it is passing.
+            m_out = to_apex <= -args.exit_from
+            taper = np.clip((self.rel[-1] - self.rel) / args.exit_taper, 0.0, 1.0)
+            taper = taper * taper * (3.0 - 2.0 * taper)
+            self.lo[m_out] = np.minimum((u_def + args.apex_room) * taper, room(+1))[m_out]
+            # (and at least exit_inside inside of the raceline shortly after the apex)
+            m_x = (to_apex <= -args.exit_from) & (to_apex >= -args.exit_to)
+            self.lo[m_x] = np.maximum(self.lo, np.minimum(args.exit_inside, room(+1)))[m_x]
         else:
             # covers the inside on the way in: in by entry_inside from early_from -> early_full m
             # before the apex, free again early_release m before it
             ramp = np.clip((args.early_from - to_apex) / (args.early_from - args.early_full), 0.0, 1.0)
             m_in = (to_apex <= args.early_from) & (to_apex >= args.early_release)
-            self.lo[m_in] = np.minimum(args.entry_inside * ramp, room(+1))[m_in]
+            # (the ramp on what the track allows, not on entry_inside: with "as far in as the wall
+            # lets it" asked for, the whole move happened in the first fifth of the ramp, a lane
+            # change the defender braked from 6 to 3 m/s for)
+            ramp = ramp * ramp * (3.0 - 2.0 * ramp)
+            self.lo[m_in] = (np.minimum(args.entry_inside, room(+1)) * ramp)[m_in]
+            # ... and on the way out it comes back to the raceline from the outside, where its
+            # early apex has taken it, without crossing to the inside of it: left free there, the
+            # fastest line swung from the outside wall over to 0.5 m inside of the raceline, across
+            # the lane of the car that had just come up on its inside.
+            self.hi[to_apex <= -args.early_out] = 0.0
 
     def offsets(self, knots_rel, values):
         """offsets for the whole lap from knot values inside the zone (zero at both ends)"""
@@ -182,12 +203,15 @@ def main():
     ap.add_argument('--w-smooth', type=float, default=0.1)
     # the late apex
     ap.add_argument('--corner-kappa', type=float, default=0.6, help='[1/m] a corner is where |kappa| exceeds this')
-    ap.add_argument('--apex-room', type=float, default=0.6, help='[m] outside of the raceline on the way in')
+    ap.add_argument('--corners', default='', help='<track>_corners.json of scripts/make_test_track.py: these corners, not the ones found by curvature')
+    ap.add_argument('--apex-room', type=float, default=0.6, help="[m] next to the defender's line: outside of it on the way in, inside on the way out")
     ap.add_argument('--before', type=float, default=5.0, help='[m] the lines split this far before the apex')
     ap.add_argument('--after', type=float, default=5.0, help='[m] and are together again this far after it')
     ap.add_argument('--ramp-from', type=float, default=4.0, help='[m] before the apex: start moving out')
     ap.add_argument('--ramp-to', type=float, default=2.5, help='[m] before the apex: fully outside')
     ap.add_argument('--release', type=float, default=1.2, help='[m] before the apex: free to cut back to the inside')
+    ap.add_argument('--exit-taper', type=float, default=2.0,
+                    help='[m] the room to the defender on the way out tapers off over this last part of the late line')
     ap.add_argument('--exit-inside', type=float, default=0.35, help='[m] inside of the raceline on the way out')
     ap.add_argument('--exit-from', type=float, default=1.0, help='[m] past the apex: inside from here')
     ap.add_argument('--exit-to', type=float, default=2.5, help='[m] past the apex: ... to here')
@@ -197,6 +221,10 @@ def main():
     ap.add_argument('--early-from', type=float, default=4.0, help='[m] before the apex: start moving in')
     ap.add_argument('--early-full', type=float, default=2.5, help='[m] before the apex: fully inside')
     ap.add_argument('--early-release', type=float, default=1.0, help='[m] before the apex: free again')
+    ap.add_argument('--early-out', type=float, default=1.0,
+                    help='[m] past the apex: from here on the early line is not inside of the raceline any more')
+    ap.add_argument('--early-after', type=float, default=0.0,
+                    help='[m] the early line is back on the raceline this far after the apex (0 = as --after)')
     ap.add_argument('--gap', type=float, default=1.5, help='[m] attacker behind the defender, for the comparison')
     ap.add_argument('--w-room', type=float, default=400.0)
     ap.add_argument('--step', type=float, default=0.3)
@@ -210,24 +238,45 @@ def main():
     kap = lines.curvature(xy, smooth=0.3)
     t_base, v_base = prob.lap(xy)
     tb = lines.lap_times(np.c_[xy, np.zeros(n), v_base])
-    found = find_corners(kap, ds, args.corner_kappa)
-    print(f'{pathlib.Path(args.raceline).name}: {n} points, lap {t_base:.2f} s, {len(found)} corners with |kappa| > {args.corner_kappa}')
+    names = None
+    if args.corners:
+        # the corners of a test track (scripts/make_test_track.py), also the ones the raceline
+        # takes flat out: there it has no curvature to find them by
+        spec = json.loads(pathlib.Path(args.corners).read_text())['corners']
+        yaw = lines.heading(xy)
+        found, names = [], [c['name'] for c in spec]
+        for c in spec:
+            ic = int(np.argmin(np.hypot(*(xy - np.asarray(c['xy_mid'])).T)))
+            half = int((0.5 * (c['s_to'] - c['s_from']) + 1.0) / ds)
+            win = (ic + np.arange(-half, half + 1)) % n
+            inside = int(np.sign(np.sum(kap[win])))
+            # the apex: where the raceline is closest to the inside wall and turns most
+            dd = np.arange(0.0, 4.0, 0.02)
+            room = np.array([dd[np.argmax(prob.clearance(np.c_[xy[i, 0] - inside * dd * np.sin(yaw[i]),
+                                                               xy[i, 1] + inside * dd * np.cos(yaw[i])]) < 0.03)] for i in win])
+            apex = int(win[np.argmin(room - 0.3 * np.abs(kap[win]))])
+            found.append((int(win[0]), int(win[-1]), apex, inside))
+        print(f'{pathlib.Path(args.raceline).name}: {n} points, lap {t_base:.2f} s, {len(found)} corners from {pathlib.Path(args.corners).name}')
+    else:
+        found = find_corners(kap, ds, args.corner_kappa)
+        print(f'{pathlib.Path(args.raceline).name}: {n} points, lap {t_base:.2f} s, {len(found)} corners with |kappa| > {args.corner_kappa}')
 
     L = n * ds
     wrap = lambda x: round(float(x % L), 2)
     d_late, d_early, corners, zones = np.zeros(n), np.zeros(n), [], []
     for c, (a, b, apex, inside) in enumerate(found):
-        name = f'corner{c + 1}'
+        name = names[c] if names else f'corner{c + 1}'
         print(f'\n{name}: apex of the raceline at s = {apex * ds:.1f} m, {"left" if inside > 0 else "right"} turn')
         res = {}
-        for kind in ('late', 'early'):
-            co = Corner(prob, xy, apex, inside, args, kind)
+        for kind in ('early', 'late'):          # the defender first: the attacker's line is relative to it
+            co = Corner(prob, xy, apex, inside, args, kind, d_def=res['early'][1] if kind == 'late' else None)
             res[kind] = (co, optimize_corner(prob, xy, co, args))
         d_late += res['late'][1]
         d_early += res['early'][1]
         # compare the three lines over the same stretch: from where the first one leaves the
         # raceline to where the last one is back on it
-        i0, i1 = res['early'][0].idx[0], res['late'][0].idx[-1]
+        i0 = res['early'][0].idx[0]
+        i1 = max(res['late'][0].idx[-1], res['early'][0].idx[-1], key=lambda i: (i - apex) % n)
         seg = (i0 + np.arange((i1 - i0) % n + 1)) % n
         i_exit = int(apex + 2.0 / ds) % n
         print(f'  {"line":12s} {"time":>6s} {"vs race":>8s} {"slowest":>8s} {"2 m after apex":>15s} {"at apex":>9s} {"clearance":>10s} {"kappa":>6s}'
@@ -275,13 +324,32 @@ def main():
               f'closest {dist.min():.2f} m at s = {il[j] * ds:.1f} m; at s = {i1 * ds:.1f} m it is '
               f'{abs(behind):.2f} m {"behind" if behind > 0 else "AHEAD"} (gained {args.gap - behind:+.2f} m)')
         li = res['late'][0].idx
+        eo = res['early'][0]
+        u_in = inside * res['early'][1][eo.idx]
+        i_in = apex - eo.before / ds + (int(np.argmax(u_in > 0.15)) if (u_in > 0.15).any() else eo.before / ds)
         corners.append(dict(name=name, inside=inside, s_apex=wrap(apex * ds),
                             s_split=wrap(li[0] * ds),                     # late line = raceline up to here
-                            # decide in the last 2.3 m before the late line starts to move out
-                            s_decide=[wrap(apex * ds - args.ramp_from - 2.0), wrap(apex * ds - args.ramp_from + 0.3)],
+                            # Decide from where a car `gap` m ahead, on the defender's line, is 0.15 m
+                            # inside of the raceline, until the late line starts to move out. (It
+                            # used to be only the last 2.3 m of that. A car that covers the inside
+                            # brakes early for its tight line, and the ego, still following it
+                            # then, braked with it: the later braking point on the outside is
+                            # half of what the switchback gains.)
+                            s_decide=[wrap(min(i_in * ds - args.gap, apex * ds - args.ramp_from - 2.0)),
+                                      wrap(apex * ds - args.ramp_from + 0.3)],
                             s_commit=wrap(apex * ds - 1.0), s_end=wrap(li[-1] * ds),
-                            s_defend=wrap(i0 * ds)))                      # early line leaves the raceline here
+                            s_defend=wrap(i0 * ds),                       # early line leaves the raceline here
+                            s_defend_end=wrap(res['early'][0].idx[-1] * ds),   # ... and is back on it here
+                            # the model's prediction for equal cars: what each line costs [s], and
+                            # what the attacker gains on the defender through the corner [m]
+                            t_raceline=round(float(times['raceline'][0][-1]), 2),
+                            t_defend=round(float(te[-1]), 2), t_attack=round(float(tl[-1]), 2),
+                            gain_m=round(float(args.gap - behind), 2),
+                            v_apex_defend=round(float(we[seg, 3].min()), 2), v_apex_attack=round(float(wl[seg, 3].min()), 2)))
         zones.append((seg, times, delay))
+        if c > 0 and (seg[0] - zones[-2][0][-1]) % n > n // 2:
+            print(f'  WARNING: the lines of {name} leave the raceline before those of {corners[-2]["name"]} are back on it: '
+                  f'the offsets add up there (shorter --early-before / --early-after, or longer straights)')
 
     base = pathlib.Path(args.raceline).with_suffix('')
     limits = dict(a_lat=args.a_lat, a_lon=args.a_lon, v_min=args.v_min, v_max=args.v_max)
