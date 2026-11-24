@@ -1,0 +1,66 @@
+sbt_a_v4: both cars at a_lat 4.3, a_lon 2.5 m/s^2, v_max 4.0 m/s
+sbt_a_v4_tight_wide_defend_1           not past           trigger True  gap +1.30 -> +1.00 -> +1.30 m, closest 1.06 m, contacts 0/0
+sbt_a_v4_tight_wide_raceline_1         ok                 trigger False gap +1.30 -> +1.30 -> +1.40 m, closest 1.19 m, contacts 0/0
+sbt_a_v4_tight_mid_defend_1            not past           trigger True  gap +1.30 -> +1.10 -> +1.30 m, closest 1.12 m, contacts 0/0
+sbt_a_v4_tight_mid_raceline_1          ok                 trigger False gap +1.20 -> +1.40 -> +1.40 m, closest 1.20 m, contacts 0/0
+sbt_a_v4_open_mid_defend_1             not past           trigger True  gap +1.30 -> +1.00 -> +1.30 m, closest 1.01 m, contacts 0/0
+sbt_a_v4_open_mid_raceline_1           ok                 trigger False gap +1.30 -> +1.40 -> +1.40 m, closest 1.23 m, contacts 0/0
+sbt_a_v4_tight_narrow_defend_1         not past           trigger True  gap +1.30 -> +1.00 -> +1.30 m, closest 0.89 m, contacts 0/0
+sbt_a_v4_tight_narrow_raceline_1       ok                 trigger False gap +1.30 -> +1.90 -> +1.80 m, closest 1.21 m, contacts 0/0
+sbt_a_v5: both cars at a_lat 4.3, a_lon 2.5 m/s^2, v_max 5.0 m/s
+sbt_a_v5_tight_wide_defend_1           ok                 trigger True  gap +1.60 -> -1.30 -> -2.20 m, closest 0.65 m, contacts 0/0
+sbt_a_v5_tight_wide_raceline_1         ok                 trigger False gap +1.60 -> +1.80 -> +1.80 m, closest 1.37 m, contacts 0/0
+sbt_a_v5_tight_mid_defend_1            not past           trigger True  gap +1.60 -> +0.80 -> +1.30 m, closest 0.91 m, contacts 0/0
+sbt_a_v5_tight_mid_raceline_1          ok                 trigger False gap +1.70 -> +2.10 -> +2.10 m, closest 1.44 m, contacts 0/0
+sbt_a_v5_open_mid_defend_1             not past           trigger True  gap +1.50 -> +0.90 -> +1.20 m, closest 0.91 m, contacts 0/0
+sbt_a_v5_open_mid_raceline_1           ok                 trigger False gap +1.50 -> +1.50 -> +1.60 m, closest 1.35 m, contacts 0/0
+sbt_a_v5_tight_narrow_defend_1         not past           trigger True  gap +1.60 -> +1.20 -> +1.40 m, closest 0.96 m, contacts 0/0
+sbt_a_v5_tight_narrow_raceline_1       ok                 trigger False gap +1.80 -> +2.80 -> +2.80 m, closest 1.51 m, contacts 0/0
+sbt_a_v6: both cars at a_lat 4.3, a_lon 2.5 m/s^2, v_max 6.0 m/s
+sbt_a_v6_tight_wide_defend_1           ok                 trigger True  gap +2.10 -> -1.30 -> -2.90 m, closest 0.53 m, contacts 0/0
+sbt_a_v6_tight_wide_raceline_1         ok                 trigger False gap +2.00 -> +2.60 -> +2.60 m, closest 1.58 m, contacts 0/0
+sbt_a_v6_tight_mid_defend_1            not past           trigger True  gap +1.80 -> +1.00 -> +1.60 m, closest 0.92 m, contacts 0/0
+sbt_a_v6_tight_mid_raceline_1          ok                 trigger False gap +1.80 -> +3.20 -> +3.10 m, closest 1.54 m, contacts 0/0
+sbt_a_v6_open_mid_defend_1             not past           trigger True  gap +1.80 -> +2.70 -> +2.60 m, closest 1.11 m, contacts 0/0
+sbt_a_v6_open_mid_raceline_1           ok                 trigger False gap +1.80 -> +2.70 -> +2.70 m, closest 1.54 m, contacts 0/0
+sbt_a_v6_tight_narrow_defend_1         not past           trigger True  gap +1.50 -> +1.50 -> +2.70 m, closest 0.88 m, contacts 0/0
+sbt_a_v6_tight_narrow_raceline_1       ok                 trigger False gap +1.70 -> +3.80 -> +3.80 m, closest 1.55 m, contacts 0/0
+(gap = opponent minus ego along the raceline: + = the ego is behind; at the decision -> where the lines rejoin -> 8 m later)
+sbt_c_v4: both cars at a_lat 4.3, a_lon 2.5 m/s^2, v_max 4.0 m/s
+sbt_c_v4_acute_wide_defend_1           not past           trigger True  gap +1.30 -> +1.30 -> +1.30 m, closest 1.18 m, contacts 0/0
+sbt_c_v4_acute_wide_raceline_1         ok                 trigger False gap +1.30 -> +1.90 -> +1.90 m, closest 1.19 m, contacts 0/0
+sbt_c_v4_acute_mid_defend_1            not past           trigger True  gap +1.30 -> +1.00 -> +1.30 m, closest 1.07 m, contacts 0/0
+sbt_c_v4_acute_mid_raceline_1          ok                 trigger False gap +1.30 -> +2.00 -> +2.00 m, closest 1.24 m, contacts 0/0
+sbt_c_v4_square_mid_defend_1           ok                 trigger True  gap +1.20 -> +0.20 -> -0.60 m, closest 0.51 m, contacts 0/0
+sbt_c_v4_square_mid_raceline_1         ok                 trigger False gap +1.30 -> +1.50 -> +1.40 m, closest 1.24 m, contacts 0/0
+sbt_c_v5: both cars at a_lat 4.3, a_lon 2.5 m/s^2, v_max 5.0 m/s
+sbt_c_v5_acute_wide_defend_1           not past           trigger True  gap +1.70 -> +0.70 -> +1.30 m, closest 0.75 m, contacts 0/0
+sbt_c_v5_acute_wide_raceline_1         ok                 trigger False gap +1.70 -> +2.60 -> +2.60 m, closest 1.38 m, contacts 0/0
+sbt_c_v5_acute_mid_defend_1            not past           trigger True  gap +1.70 -> +1.40 -> +1.40 m, closest 0.89 m, contacts 0/0
+sbt_c_v5_acute_mid_raceline_1          ok                 trigger False gap +1.70 -> +2.90 -> +2.90 m, closest 1.52 m, contacts 0/0
+sbt_c_v5_square_mid_defend_1           not past           trigger True  gap +1.40 -> +0.30 -> +0.10 m, closest 0.54 m, contacts 0/0
+sbt_c_v5_square_mid_raceline_1         ok                 trigger False gap +1.60 -> +1.80 -> +1.80 m, closest 1.35 m, contacts 0/0
+sbt_c_v6: both cars at a_lat 4.3, a_lon 2.5 m/s^2, v_max 6.0 m/s
+sbt_c_v6_acute_wide_defend_1           not past           trigger True  gap +1.70 -> +0.30 -> +1.00 m, closest 0.54 m, contacts 0/0
+sbt_c_v6_acute_wide_raceline_1         ok                 trigger False gap +2.00 -> +3.70 -> +3.70 m, closest 1.49 m, contacts 0/0
+sbt_c_v6_acute_mid_defend_1            not past           trigger True  gap +2.00 -> +2.30 -> +2.40 m, closest 1.09 m, contacts 0/0
+sbt_c_v6_acute_mid_raceline_1          ok                 trigger False gap +2.50 -> +4.40 -> +4.20 m, closest 1.45 m, contacts 0/0
+sbt_c_v6_square_mid_defend_1           ok                 trigger True  gap +1.60 -> -1.00 -> -2.20 m, closest 0.57 m, contacts 0/0
+sbt_c_v6_square_mid_raceline_1         ok                 trigger False gap +2.20 -> +3.60 -> +3.50 m, closest 1.54 m, contacts 0/0
+(gap = opponent minus ego along the raceline: + = the ego is behind; at the decision -> where the lines rejoin -> 8 m later)
+sbt_b_v4: both cars at a_lat 4.3, a_lon 2.5 m/s^2, v_max 4.0 m/s
+sbt_b_v4_hairpin_wide_defend_1         not past           trigger True  gap +1.30 -> +1.40 -> +1.30 m, closest 0.82 m, contacts 0/0
+sbt_b_v4_hairpin_wide_raceline_1       ok                 trigger False gap +1.30 -> +2.40 -> +2.40 m, closest 1.23 m, contacts 0/0
+sbt_b_v4_hairpin_mid_defend_1          not past           trigger True  gap +1.30 -> +1.60 -> +1.40 m, closest 0.66 m, contacts 0/0
+sbt_b_v4_hairpin_mid_raceline_1        ok                 trigger False gap +1.30 -> +2.20 -> +2.20 m, closest 1.22 m, contacts 0/0
+sbt_b_v5: both cars at a_lat 4.3, a_lon 2.5 m/s^2, v_max 5.0 m/s
+sbt_b_v5_hairpin_wide_defend_1         not past           trigger True  gap +1.80 -> +2.20 -> +2.10 m, closest 1.20 m, contacts 0/0
+sbt_b_v5_hairpin_wide_raceline_1       ok                 trigger False gap +1.60 -> +3.20 -> +3.00 m, closest 1.38 m, contacts 0/0
+sbt_b_v5_hairpin_mid_defend_1          not past           trigger True  gap +1.40 -> +2.90 -> +2.60 m, closest 0.71 m, contacts 0/0
+sbt_b_v5_hairpin_mid_raceline_1        ok                 trigger False gap +1.60 -> +3.50 -> +3.20 m, closest 1.38 m, contacts 0/0
+sbt_b_v6: both cars at a_lat 4.3, a_lon 2.5 m/s^2, v_max 6.0 m/s
+sbt_b_v6_hairpin_wide_defend_1         not past           trigger True  gap +2.10 -> +3.70 -> +3.30 m, closest 1.44 m, contacts 0/0
+sbt_b_v6_hairpin_wide_raceline_1       ok                 trigger False gap +2.30 -> +4.90 -> +3.80 m, closest 1.48 m, contacts 0/0
+sbt_b_v6_hairpin_mid_defend_1          not past           trigger True  gap +2.00 -> +4.60 -> +3.70 m, closest 0.98 m, contacts 0/0
+sbt_b_v6_hairpin_mid_raceline_1        ok                 trigger False gap +1.90 -> +4.60 -> +3.70 m, closest 1.50 m, contacts 0/0
+(gap = opponent minus ego along the raceline: + = the ego is behind; at the decision -> where the lines rejoin -> 8 m later)

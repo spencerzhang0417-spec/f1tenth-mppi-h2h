@@ -1,0 +1,20 @@
+sbt_a_v5: both cars at a_lat 4.3, a_lon 2.5 m/s^2, v_max 5.0 m/s
+sbt_a_v5_tight_wide_defend_1           ok                 trigger True  gap +1.60 -> -1.30 -> -1.90 m, closest 0.55 m, contacts 0/0
+sbt_a_v5_tight_wide_defend_2           ok                 trigger True  gap +1.50 -> -1.30 -> -2.10 m, closest 0.59 m, contacts 0/0
+sbt_a_v5_tight_wide_defend_3           ok                 trigger True  gap +1.70 -> -1.20 -> -1.80 m, closest 0.61 m, contacts 0/0
+sbt_a_v6: both cars at a_lat 4.3, a_lon 2.5 m/s^2, v_max 6.0 m/s
+sbt_a_v6_tight_wide_defend_1           ok                 trigger True  gap +2.20 -> -1.20 -> -2.60 m, closest 0.58 m, contacts 0/0
+sbt_a_v6_tight_wide_defend_2           ok                 trigger True  gap +2.10 -> -1.30 -> -2.50 m, closest 0.57 m, contacts 0/0
+sbt_a_v6_tight_wide_defend_3           ok                 trigger True  gap +2.10 -> -1.40 -> -2.70 m, closest 0.51 m, contacts 0/0
+(gap = opponent minus ego along the raceline: + = the ego is behind; at the decision -> where the lines rejoin -> 8 m later)
+sbt_c_v5: both cars at a_lat 4.3, a_lon 2.5 m/s^2, v_max 5.0 m/s
+sbt_c_v5_acute_wide_defend_1           not past           trigger True  gap +1.70 -> +0.80 -> +1.30 m, closest 0.70 m, contacts 0/0
+sbt_c_v5_acute_wide_defend_2           not past           trigger True  gap +1.60 -> +0.90 -> +1.40 m, closest 0.75 m, contacts 0/0
+sbt_c_v5_square_mid_defend_1           not past           trigger True  gap +1.40 -> +0.80 -> +1.10 m, closest 0.86 m, contacts 0/0
+sbt_c_v5_square_mid_defend_2           not past           trigger True  gap +1.30 -> +0.40 -> +0.20 m, closest 0.62 m, contacts 0/0
+sbt_c_v6: both cars at a_lat 4.3, a_lon 2.5 m/s^2, v_max 6.0 m/s
+sbt_c_v6_acute_wide_defend_1           not past           trigger True  gap +1.80 -> +1.10 -> +1.70 m, closest 0.98 m, contacts 0/0
+sbt_c_v6_acute_wide_defend_2           ok                 trigger True  gap +1.80 -> -1.20 -> -2.70 m, closest 0.43 m, contacts 0/0
+sbt_c_v6_square_mid_defend_1           ok                 trigger True  gap +1.50 -> -1.30 -> -3.60 m, closest 0.59 m, contacts 0/0
+sbt_c_v6_square_mid_defend_2           ok                 trigger True  gap +1.50 -> -0.40 -> -1.70 m, closest 0.49 m, contacts 0/0
+(gap = opponent minus ego along the raceline: + = the ego is behind; at the decision -> where the lines rejoin -> 8 m later)

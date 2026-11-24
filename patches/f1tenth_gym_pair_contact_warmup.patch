@@ -1,0 +1,18 @@
+diff --git a/f1tenth_gym/envs/simulator.py b/f1tenth_gym/envs/simulator.py
+index ce36e8a..80490fa 100644
+--- a/f1tenth_gym/envs/simulator.py
++++ b/f1tenth_gym/envs/simulator.py
+@@ -534,6 +534,13 @@ class F110Simulator:
+                 cfg.solver_iterations,
+                 cfg.device,
+             )
++            # Compile the pair kernel now, with two bodies far apart. Left to its first real
++            # call, that is the first step in which two cars' bounding boxes overlap, and the
++            # whole simulation then stands still for ~0.3 s of wall time just as two cars come
++            # side by side (controllers running on wall time see every other car jump).
++            box = np.array([[0.3, 0.15], [0.3, -0.15], [-0.3, -0.15], [-0.3, 0.15]])
++            self.pair_contact(box, box + 10.0, np.zeros(2), np.full(2, 10.0), np.zeros(2), 0.0,
++                              np.zeros(2), 0.0, float(self.vehicle_params.m), float(self.vehicle_params.I))
+ 
+     def _world_velocity(self, state):
+         """(vx, vy, omega) in world axes for the model's native state."""

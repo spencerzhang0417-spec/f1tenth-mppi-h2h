@@ -113,6 +113,33 @@ A switchback starts only when the opponent really is on the inside, the ego is c
 enough, and it has the entry speed. It is given up before the turn-in if the opponent goes
 to the outside after all.
 
+The late-apex line is defined by where the *defender* is, not by the raceline: 0.6 m outside
+of the defender's line on the way in, 0.6 m inside of it on the way out, and otherwise as
+fast as possible. In a wide corner, where the raceline comes in from the outside anyway, it
+is then nearly the raceline; only as much of a detour as it takes to leave the inside to the
+other car.
+
+After the turn-in the ego no longer follows a fixed line. The late-apex line and the
+defender's line both end on the raceline, and two cars next to each other cannot:
+
+- **The cut-back lane.** Once the ego is on the inside of the defender, its reference is the
+  late-apex line moved further in wherever that car will be next to it (`sb_offsets`).
+- **In line, no faster than it can brake.** While the ego crosses the defender's track from
+  the outside to the inside it is right behind it, and closes in only as fast as it could
+  still brake.
+- **Finishing.** Where the lines are together again and the ego is not clear of the car yet,
+  the switchback is handed over as a pass on the inside instead of back to following.
+- **Timing.** The two lines cross once, around the apex, and next to the defender there is
+  the one place the ego must not be. From the line model (both lines' speed profiles from
+  where the cars are now) the ego is either at the crossing clearly first, or it scales its
+  speed to arrive just behind the defender, still faster than it. The defender is predicted
+  along its line (inside wall to outside wall within a second), not on the offset it has now,
+  and the ego does not brake behind a car that will have moved out of its way.
+
+Each corner also carries the line model's prediction of what the late-apex line gains on a
+car covering the inside there (`gain_m`); corners predicted to gain less than
+`h2h_sb_min_gain` (1 m) are not armed.
+
 ## 3. Acting: what the controller receives
 
 The tactician never steers. It hands MPPI three things:
@@ -161,6 +188,12 @@ ros2 launch mppi h2h_sim_launch.py latency:=false        # ideal simulator, no d
 ros2 launch mppi h2h_sim_launch.py open_foxglove:=true   # with the viewer
 ```
 
+One local change to the simulator is needed for close racing: f1tenth_gym compiles its
+car-to-car contact code the first time two cars' bounding boxes overlap, and the whole
+simulation stands still for about 0.3 s just as two cars come side by side.
+[patches/f1tenth_gym_pair_contact_warmup.patch](patches/f1tenth_gym_pair_contact_warmup.patch)
+compiles it at start-up instead (`git apply` it in `f1tenth_gym_ros/f1tenth_gym`).
+
 Switchback test, two equal cars, the opponent on the early-apex line and the ego 1.5 m
 behind it:
 
@@ -168,6 +201,64 @@ behind it:
 ros2 launch mppi h2h_sim_launch.py latency:=false pace:=race raceline:=race2_raceline_opt.csv \
     opp_controller:=mppi opp_line:=race2_raceline_opt_earlyapex.csv start_gap:=1.5 \
     switchback:=race2_raceline_opt_apex.json
+```
+
+### Switchback test tracks
+
+Three generated tracks with nine corners that differ in how far the track turns, how tight the
+inside wall is and how wide the track is ([scripts/make_test_track.py](scripts/make_test_track.py)):
+
+| Track | Corner | Turn | Inside radius | Width |
+| --- | --- | --- | --- | --- |
+| `sbt_a` | `tight_wide` | 90 deg | 0.6 m | 3.0 m |
+| `sbt_a` | `tight_mid` | 90 deg | 0.6 m | 2.2 m |
+| `sbt_a` | `open_mid` | 90 deg | 1.5 m | 2.2 m |
+| `sbt_a` | `tight_narrow` | 90 deg | 0.6 m | 1.6 m |
+| `sbt_b` | `hairpin_wide` | 180 deg | 0.6 m | 3.0 m |
+| `sbt_b` | `hairpin_mid` | 180 deg | 1.0 m | 2.2 m |
+| `sbt_c` | `acute_wide` | 135 deg (acute corner) | 0.6 m | 3.0 m |
+| `sbt_c` | `acute_mid` | 135 deg (acute corner) | 0.6 m | 2.2 m |
+| `sbt_c` | `square_mid` | 90 deg | 1.0 m | 2.2 m |
+
+![Test track sbt_a](mppi/maps/sbt_a.png)
+
+Every track has a raceline and the defender's / attacker's lines per top speed (4, 5 and
+6 m/s; a line set is `<track>_v<speed>`):
+
+```bash
+scripts/sb_setup.sh                     # maps, racelines, defender / attacker lines
+```
+
+```bash
+colcon build --symlink-install --packages-select mppi
+```
+
+```bash
+scripts/sb_test.py sbt_a                # every corner at 4, 5 and 6 m/s: car ahead defends / does not
+```
+
+```bash
+scripts/sb_plot.py /tmp/sb_test/sbt_a_v6_tight_wide_defend_1.npy     # what the two cars drove
+```
+
+```bash
+scripts/sb_replay.py sbt_a tight_wide --speed 6     # watch one corner in Foxglove, over and over
+```
+
+`sb_replay.py` starts the simulator once and puts both cars back in front of the corner
+every time they are through it (Foxglove on port 8766; switch on `/h2h/markers`).
+
+`sb_test.py` runs one corner at a time and reports, from the simulator's ground truth,
+whether the switchback started, the gap before and after the corner, the closest the cars
+came and any contact. The two cars run the same controller at the same pace through the
+corner and after it; on the straight before it the car ahead drives at 0.85 of its speed
+(`--opp-straight`), so that the ego arrives right behind a car it cannot pass on the straight.
+The same tracks run as an ordinary race:
+
+```bash
+ros2 launch mppi h2h_sim_launch.py map:=sbt_a raceline:=sbt_a_v6_raceline.csv pace:=race latency:=false \
+    opp_controller:=mppi opp_line_set:=sbt_a_v6_raceline_apex.json switchback:=sbt_a_v6_raceline_apex.json \
+    car_params:='{"v_max": 6.0, "max_speed": 6.5}' start_gap:=3 start_s:=40 sync_start:=10 open_foxglove:=true
 ```
 
 One measured run (lap times, overtakes, collisions, closest distance):
@@ -190,8 +281,13 @@ launch arguments is at the top of
 | `mppi/launch/h2h_sim_launch.py` | Two-car (up to four-car) simulation |
 | `scripts/optimize_raceline.py` | Minimum-lap-time raceline for a map |
 | `scripts/make_apex_lines.py` | Early-apex and late-apex lines per corner |
+| `scripts/make_test_track.py`, `scripts/sb_setup.sh` | Switchback test tracks: corners of different inside radius and width |
+| `scripts/sb_test.py`, `scripts/sb_plot.py` | Switchback test corner by corner, and a picture of a run |
+| `scripts/sb_replay.py` | One corner replayed in the simulator for the viewer |
 | `scripts/h2h_monitor.py`, `scripts/run_h2h.sh` | Measure a run: overtakes, collisions, gaps |
 | `scripts/draw_switchback.py` | The switchback picture above |
+| `patches/` | The start-up fix for the simulator's first-contact freeze |
+| `test_results/` | Results and pictures of the switchback tests |
 
 ## Status
 
@@ -203,6 +299,35 @@ real car yet.
   overtake against either.
 - The pass logic has been reworked since then (get beside the car instead of clear ahead;
   pace-based prediction) and has not been re-measured in the same way.
+- Switchback on the test tracks (`scripts/sb_test.py`; no delays, a_lat 4.3 m/s^2, a_lon
+  2.5 m/s^2; results and a picture of every run in `test_results/switchback_2026-11-23/`).
+  54 runs, every corner at 4, 5 and 6 m/s top speed, once with the car ahead covering the
+  inside and once with it on the raceline: the switchback started in 27 of 27 defended runs
+  and in 0 of 27 others; no contact in any run. Gap to the car ahead [m] at the decision ->
+  8 m after the corner (+ = the ego is behind; **bold** = overtaken):
+
+  | Corner | 4 m/s | 5 m/s | 6 m/s |
+  | --- | --- | --- | --- |
+  | `tight_wide` (90 deg, wide) | +1.3 -> +1.3 | **+1.6 -> -2.2** | **+2.1 -> -2.9** |
+  | `square_mid` (90 deg, inside radius 1.0 m) | **+1.2 -> -0.6** | +1.4 -> +0.1 | **+1.6 -> -2.2** |
+  | `acute_wide` (135 deg, wide) | +1.3 -> +1.3 | +1.7 -> +1.3 | +1.7 -> +1.0 |
+  | `tight_mid` (90 deg) | +1.3 -> +1.3 | +1.6 -> +1.3 | +1.8 -> +1.6 |
+  | `open_mid` (90 deg, inside radius 1.5 m) | +1.3 -> +1.3 | +1.5 -> +1.2 | +1.8 -> +2.6 |
+  | `acute_mid` (135 deg) | +1.3 -> +1.3 | +1.7 -> +1.4 | +2.0 -> +2.4 |
+  | `tight_narrow` (90 deg, 1.6 m wide) | +1.3 -> +1.3 | +1.6 -> +1.4 | +1.5 -> +2.7 |
+  | `hairpin_wide` (180 deg) | +1.3 -> +1.3 | +1.8 -> +2.1 | +2.1 -> +3.3 |
+  | `hairpin_mid` (180 deg) | +1.3 -> +1.4 | +1.4 -> +2.6 | +2.0 -> +3.7 |
+
+  Repeats of the three best corners: `tight_wide` 4 of 4 overtakes at 5 m/s and 4 of 4 at
+  6 m/s; `square_mid` 0 of 3 at 5 m/s (twice level with the other car) and 3 of 3 at 6 m/s;
+  `acute_wide` 0 of 3 at 5 m/s and 1 of 3 at 6 m/s. With the switchback switched off against
+  the same defender (4 runs) the ego stayed behind and lost 0.2-1.2 m through the corner.
+  What it shows: the switchback needs a corner the defender has to brake for and room to cut
+  back. At 4 m/s these corners are nearly flat out on any line; in the hairpins and the narrow
+  corners the inside line costs the defender nothing, and going wide loses ground. The line
+  model's `gain_m` does not predict this well (it promises 1.5-2 m in `hairpin_wide`): choose
+  the corners from a test like this one (`h2h_sb_corners`) rather than by `h2h_sb_min_gain`.
+  One run per cell, on a computer that was also running another simulation.
 - Judging corners by the speed actually driven there (`h2h_grip_use`) is off by default:
   it enabled a pass on the inside into a hairpin, but also caused a crash in testing.
 

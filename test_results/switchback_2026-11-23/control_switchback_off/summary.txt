@@ -1,0 +1,9 @@
+sbt_a_v5: both cars at a_lat 4.3, a_lon 2.5 m/s^2, v_max 5.0 m/s
+sbt_a_v5_tight_wide_defend_1           ok (not armed)     trigger False gap +1.60 -> +1.80 -> +1.80 m, closest 1.52 m, contacts 0/0
+sbt_a_v6: both cars at a_lat 4.3, a_lon 2.5 m/s^2, v_max 6.0 m/s
+sbt_a_v6_tight_wide_defend_1           ok (not armed)     trigger False gap +2.10 -> +2.50 -> +2.50 m, closest 1.59 m, contacts 0/0
+(gap = opponent minus ego along the raceline: + = the ego is behind; at the decision -> where the lines rejoin -> 8 m later)
+sbt_c_v6: both cars at a_lat 4.3, a_lon 2.5 m/s^2, v_max 6.0 m/s
+sbt_c_v6_acute_wide_defend_1           ok (not armed)     trigger False gap +1.80 -> +2.90 -> +3.00 m, closest 1.54 m, contacts 0/0
+sbt_c_v6_square_mid_defend_1           ok (not armed)     trigger False gap +1.60 -> +2.40 -> +2.10 m, closest 1.44 m, contacts 0/0
+(gap = opponent minus ego along the raceline: + = the ego is behind; at the decision -> where the lines rejoin -> 8 m later)
