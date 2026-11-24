@@ -1,0 +1,45 @@
+{
+ "track": "sbt_c",
+ "length": 85.3,
+ "corners": [
+  {
+   "name": "acute_wide",
+   "r_in": 0.6,
+   "width": 3.0,
+   "turn_deg": 135,
+   "s_from": 20.83,
+   "s_to": 25.76,
+   "s_mid": 23.29,
+   "xy_mid": [
+    24.866,
+    1.287
+   ]
+  },
+  {
+   "name": "acute_mid",
+   "r_in": 0.6,
+   "width": 2.2,
+   "turn_deg": 135,
+   "s_from": 56.2,
+   "s_to": 60.19,
+   "s_mid": 58.19,
+   "xy_mid": [
+    1.049,
+    25.466
+   ]
+  },
+  {
+   "name": "square_mid",
+   "r_in": 1.0,
+   "width": 2.2,
+   "turn_deg": 90,
+   "s_from": 82.0,
+   "s_to": 85.28,
+   "s_mid": 83.64,
+   "xy_mid": [
+    0.608,
+    0.622
+   ]
+  }
+ ]
+}

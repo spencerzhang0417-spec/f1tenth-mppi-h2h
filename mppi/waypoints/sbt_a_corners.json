@@ -1,0 +1,58 @@
+{
+ "track": "sbt_a",
+ "length": 96.65,
+ "corners": [
+  {
+   "name": "tight_wide",
+   "r_in": 0.6,
+   "width": 3.0,
+   "turn_deg": 90,
+   "s_from": 21.5,
+   "s_to": 24.78,
+   "s_mid": 23.14,
+   "xy_mid": [
+    24.378,
+    0.608
+   ]
+  },
+  {
+   "name": "tight_mid",
+   "r_in": 0.6,
+   "width": 2.2,
+   "turn_deg": 90,
+   "s_from": 46.0,
+   "s_to": 48.65,
+   "s_mid": 47.32,
+   "xy_mid": [
+    24.502,
+    24.502
+   ]
+  },
+  {
+   "name": "open_mid",
+   "r_in": 1.5,
+   "width": 2.2,
+   "turn_deg": 90,
+   "s_from": 69.37,
+   "s_to": 73.43,
+   "s_mid": 71.4,
+   "xy_mid": [
+    0.762,
+    24.238
+   ]
+  },
+  {
+   "name": "tight_narrow",
+   "r_in": 0.6,
+   "width": 1.6,
+   "turn_deg": 90,
+   "s_from": 94.45,
+   "s_to": 96.63,
+   "s_mid": 95.54,
+   "xy_mid": [
+    0.41,
+    0.41
+   ]
+  }
+ ]
+}

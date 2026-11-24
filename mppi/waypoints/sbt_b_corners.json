@@ -1,0 +1,32 @@
+{
+ "track": "sbt_b",
+ "length": 53.19,
+ "corners": [
+  {
+   "name": "hairpin_wide",
+   "r_in": 0.6,
+   "width": 3.0,
+   "turn_deg": 180,
+   "s_from": 20.0,
+   "s_to": 26.58,
+   "s_mid": 23.29,
+   "xy_mid": [
+    22.1,
+    2.1
+   ]
+  },
+  {
+   "name": "hairpin_mid",
+   "r_in": 1.0,
+   "width": 2.2,
+   "turn_deg": 180,
+   "s_from": 46.6,
+   "s_to": 53.17,
+   "s_mid": 49.89,
+   "xy_mid": [
+    -2.1,
+    2.1
+   ]
+  }
+ ]
+}
