@@ -9,7 +9,8 @@ foreach(PACKAGE
   geometry_msgs
   nav_msgs
   ackermann_msgs
-  visualization_msgs)
+  visualization_msgs
+  sensor_msgs)
 
   find_package(${PACKAGE} REQUIRED)
 
@@ -29,6 +30,10 @@ install(PROGRAMS
   scripts/pose_fusion_node.py
   scripts/h2h.py
   scripts/utils.py
+  scripts/opponent_ekf.py
+  scripts/opponent_ekf_node.py
+  scripts/follow_node.py
+  scripts/realsense_imu_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
