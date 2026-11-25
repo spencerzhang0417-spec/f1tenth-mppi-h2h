@@ -4,6 +4,7 @@
     /opponent/odom (opponent_ekf_node) --\\
     /odom          (VESC speed)          >-- follow_node --> /drive
     /scan          (safety only)       --/                  log CSV (log_dir)
+    /joy           (deadman)          --/
 
 Speed: drive at the opponent's estimated speed, plus a correction toward the gap reference and a
 damping term on the closing speed (PD on the gap):
@@ -21,7 +22,13 @@ CENTER relative to the ego REAR AXLE). Measure both lengths on the cars.
 Steering: 'pursuit' steers toward the opponent's center (pure pursuit, the opponent is the
 lookahead point), so the ego stays behind it if the human drifts; 'straight' keeps 0.
 
+Deadman: the car only drives while joy button deadman_button is held (8 = left trigger on the
+8BitDo Ultimate 2C; -1 = no deadman). Released, or no /joy message for deadman_timeout (node or
+controller gone): speed 0 at once, and the command ramps up from 0 again when it is pressed. The
+car stack's ackermann_mux passes /drive without any button, so this is the only deadman for following.
+
 Stops (speed 0, steering 0), whatever the filter says:
+    - deadman released or /joy stale: immediately
     - no confirmed track for track_timeout (lost, or the EKF node is not running): brake at max_decel
     - gap < min_gap from the filter: immediately
     - LiDAR: any return in the corridor ahead (|y| < corridor_half_width) closer than estop_gap to the
@@ -43,7 +50,7 @@ from nav_msgs.msg import Odometry
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import Joy, LaserScan
 
 FIELDS = ('t', 'state', 'gap', 'gap_lidar', 'v_ego', 'v_opp', 'v_opp_sd', 'v_opp_truth', 'opp_y', 'v_cmd',
           'steer')
@@ -89,6 +96,10 @@ class FollowNode(Node):
             'laser_x': 0.27,               # LiDAR ahead of the rear axle
             'corridor_half_width': 0.2,
             'estop_gap': 0.15,             # [m] from the front bumper
+            # deadman
+            'joy_topic': '/joy',
+            'deadman_button': 8,           # joy button to hold (8 = left trigger, 8BitDo Ultimate 2C); -1 = off
+            'deadman_timeout': 0.3,        # [s] /joy older than this counts as released
             # log
             'log_dir': os.path.expanduser('~/follow_logs'),   # '' = no CSV
         }
@@ -103,6 +114,8 @@ class FollowNode(Node):
         self.v_ego = 0.0
         self.v_truth = math.nan
         self.gap_lidar = math.inf
+        self.deadman_button = int(p['deadman_button'])
+        self.joy = None          # (receive time, deadman button held)
         self.v_cmd = 0.0
         self.t_last = None
         self.state = 'wait'
@@ -114,6 +127,8 @@ class FollowNode(Node):
         self.create_subscription(LaserScan, p['scan_topic'], self.scan_cb, qos_profile_sensor_data)
         if p['truth_topic'] not in ('', 'none'):
             self.create_subscription(Odometry, p['truth_topic'], self.truth_cb, 20)
+        if self.deadman_button >= 0:
+            self.create_subscription(Joy, p['joy_topic'], self.joy_cb, 10)
         self.drive_pub = self.create_publisher(AckermannDriveStamped, p['drive_topic'], 1)
         self.create_timer(1.0 / float(p['rate']), self.step)
 
@@ -128,6 +143,10 @@ class FollowNode(Node):
         self.get_logger().info(
             f'follow: gap {p["gap_ref"]} m (stop < {p["min_gap"]}), max {p["max_speed"]} m/s, steer {p["steer_mode"]}; '
             f'{p["opponent_topic"]} + {p["odom_topic"]} + {p["scan_topic"]} -> {p["drive_topic"]}')
+        if self.deadman_button >= 0:
+            self.get_logger().info(f'deadman: hold joy button {self.deadman_button} ({p["joy_topic"]}) to drive')
+        else:
+            self.get_logger().warning('deadman off (deadman_button < 0): the car drives as soon as it has a track')
 
     def now(self):
         return self.get_clock().now().nanoseconds * 1e-9
@@ -135,6 +154,15 @@ class FollowNode(Node):
     # ------------------------------------------------------------------ inputs
     def opp_cb(self, msg):
         self.opp = (self.now(), msg)
+
+    def joy_cb(self, msg):
+        b = self.deadman_button
+        self.joy = (self.now(), b < len(msg.buttons) and msg.buttons[b] == 1)
+
+    def deadman_held(self, t):
+        if self.deadman_button < 0:
+            return True
+        return self.joy is not None and self.joy[1] and t - self.joy[0] < float(self.p['deadman_timeout'])
 
     def odom_cb(self, msg):
         self.v_ego = msg.twist.twist.linear.x
@@ -179,7 +207,9 @@ class FollowNode(Node):
 
         # stops, most urgent first
         hard = False
-        if self.gap_lidar < float(p['estop_gap']):
+        if not self.deadman_held(t):
+            state, hard = 'deadman', True
+        elif self.gap_lidar < float(p['estop_gap']):
             state, hard = 'estop_lidar', True
         elif fresh and gap < float(p['min_gap']):
             state, hard = 'too_close', True

@@ -1,12 +1,30 @@
 """Hallway experiment: a human drives the opponent, the ego car estimates its speed and follows at
 a fixed gap (default 0.5 m bumper to bumper). Straight line only.
 
+Terminal 1 (SICK LiDAR + VESC):
+~/setup_ros2.bash sick
+
+Terminal 2 (perception + opponent EKF + follow), sourced as in vision_lab car_observations_launch.py:
+cd ~/f1tenth_ws
+source /opt/ros/jazzy/setup.bash
+source ~/f1tenth_ws/install/setup.bash
+
+env PATH="/usr/bin:$PATH" \
+    PYTHONPATH="$HOME/numpy1_fix:${PYTHONPATH:-}" \
+    ros2 launch mppi follow_experiment_launch.py
+
+The env prefix is required while perception is started here (lab 10 node: system cv2, NumPy 1.x).
+
+The car drives only while the deadman is held: joy button 8, the left trigger of the 8BitDo
+Ultimate 2C (deadman_button:=<index>; -1 = no deadman). The left bumper (teleop) still overrides.
+
+Arguments (same prefix):
     ros2 launch mppi follow_experiment_launch.py                          # perception started here
     ros2 launch mppi follow_experiment_launch.py perception:=false        # lab 10 node started elsewhere
     ros2 launch mppi follow_experiment_launch.py max_speed:=1.5 gap_ref:=0.6
     ros2 launch mppi follow_experiment_launch.py truth_topic:=/opp/odom   # log the opponent's own speed
 
-Needs the car stack first (VESC + ackermann_mux on /drive, LiDAR on /scan); hold the deadman button.
+Needs the car stack first (VESC + ackermann_mux on /drive, LiDAR on /scan, joy on /joy).
 Starts: lab 10 car_observations (perception:=true), opponent_ekf_node, follow_node.
 Log: ~/follow_logs/follow_<date>_<time>.csv -> python3 scripts/plot_follow.py <csv>
 """
@@ -48,6 +66,8 @@ def generate_launch_description():
         DeclareLaunchArgument('max_speed', default_value='1.5', description='start slow, raise per run'),
         DeclareLaunchArgument('truth_topic', default_value='none',
                               description="opponent's own odometry, logged only ('none' = off)"),
+        DeclareLaunchArgument('deadman_button', default_value='8',
+                              description='joy button to hold while driving (8 = left trigger); -1 = off'),
     ]
     ekf = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(get_package_share_directory('mppi'), 'launch',
@@ -63,6 +83,7 @@ def generate_launch_description():
             'gap_ref': ParameterValue(lc('gap_ref'), value_type=float),
             'max_speed': ParameterValue(lc('max_speed'), value_type=float),
             'truth_topic': ParameterValue(lc('truth_topic'), value_type=str),
+            'deadman_button': ParameterValue(lc('deadman_button'), value_type=int),
         }],
     )
     return LaunchDescription(args + [ekf, follow])

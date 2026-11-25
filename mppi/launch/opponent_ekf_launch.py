@@ -1,5 +1,26 @@
 """Opponent pose and speed on the real car: lab 10 car observations + VESC speed + gyro -> EKF.
 
+Terminal 1 (SICK LiDAR + VESC):
+~/setup_ros2.bash sick
+
+Terminal 2 (perception + opponent EKF), sourced as in vision_lab car_observations_launch.py:
+cd ~/f1tenth_ws
+source /opt/ros/jazzy/setup.bash
+source ~/f1tenth_ws/install/setup.bash
+
+env PATH="/usr/bin:$PATH" \
+    PYTHONPATH="$HOME/numpy1_fix:${PYTHONPATH:-}" \
+    ros2 launch mppi opponent_ekf_launch.py perception:=true pose_topic:=none motion:=straight
+
+Terminal 3 (inspection):
+source /opt/ros/jazzy/setup.bash
+source ~/f1tenth_ws/install/setup.bash
+ros2 topic echo /opponent/odom
+
+The env prefix is required with perception:=true: the lab 10 node imports the system cv2, built
+for NumPy 1.x, and without it dies on "numpy.core.multiarray failed to import".
+
+Arguments (same prefix):
     ros2 launch mppi opponent_ekf_launch.py                     # gyro: VESC IMU (/sensors/imu/raw)
     ros2 launch mppi opponent_ekf_launch.py imu:=camera         # gyro: RealSense D435i
     ros2 launch mppi opponent_ekf_launch.py perception:=true    # also start lab 10 car_observations
