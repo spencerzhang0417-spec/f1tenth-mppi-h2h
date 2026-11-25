@@ -1,0 +1,43 @@
+diff --git a/vision_lab/launch/car_observations_launch.py b/vision_lab/launch/car_observations_launch.py
+index 3d38f3f..7c2b1a2 100644
+--- a/vision_lab/launch/car_observations_launch.py
++++ b/vision_lab/launch/car_observations_launch.py
+@@ -42,10 +42,15 @@ ENGINE_NAME = "rtdetrv2_fp16.engine"
+ PYTHON = str(Path.home() / "vision-env/bin/python")
+ 
+ # LiDAR (forward, left, up) -> camera optical (right, down, forward).
++# Not the ideal axis swap: the camera is pitched up 2.76 deg and yawed 1.83 deg relative to the
++# scan plane. Measured 2026-11-25 with a 12 x 21 cm box at 1.14 m and 2.69 m: the ideal matrix put
++# the scan 33 px too high and 22 px too far left at both distances, so beyond ~1 m the LiDAR point
++# fell above the detection box and the observation was dropped.
++# Ideal: [0, -1, 0,  0, 0, -1,  1, 0, 0]
+ ROTATION_LIDAR_TO_CAMERA_OPTICAL = [
+-    0.0, -1.0,  0.0,
+-    0.0,  0.0, -1.0,
+-    1.0,  0.0,  0.0,
++    0.031940, -0.999490,  0.000000,
++    0.048102,  0.001537, -0.998841,
++    0.998332,  0.031903,  0.048127,
+ ]  # fmt: skip
+ 
+ PARAMETERS = {
+diff --git a/vision_lab/launch/lidar_projection_launch.py b/vision_lab/launch/lidar_projection_launch.py
+index b4c7088..4299103 100644
+--- a/vision_lab/launch/lidar_projection_launch.py
++++ b/vision_lab/launch/lidar_projection_launch.py
+@@ -48,9 +48,12 @@ PARAMETERS = {
+ 
+     # LiDAR (x forward, y left, z up) -> camera optical (x right, y down, z forward)
+     "rotation_lidar_to_camera_optical": [
+-        0.0, -1.0, 0.0,
+-        0.0, 0.0, -1.0,
+-        1.0, 0.0, 0.0,
++        # 0.0, -1.0, 0.0,
++        # 0.0, 0.0, -1.0,
++        # 1.0, 0.0, 0.0,
++        0.031940, -0.999490,  0.000000,
++        0.048102,  0.001537, -0.998841,
++        0.998332,  0.031903,  0.048127,
+     ],
+ 
+     # Runtime

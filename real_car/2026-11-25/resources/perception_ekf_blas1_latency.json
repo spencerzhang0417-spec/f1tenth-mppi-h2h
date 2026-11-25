@@ -1,0 +1,52 @@
+{
+  "duration_s": 45.0,
+  "observations": {
+    "count": 650,
+    "rate_hz": 15.0,
+    "period_ms": {
+      "mean": 66.7,
+      "p50": 70.1,
+      "p95": 78.4,
+      "max": 86.5
+    },
+    "age_ms": {
+      "mean": 63.4,
+      "p50": 62.5,
+      "p95": 74.0,
+      "max": 77.6
+    },
+    "image_minus_scan_ms": {
+      "mean": 12.4,
+      "p50": 12.3,
+      "p95": 12.9,
+      "max": 29.2
+    },
+    "frames_with_detection_pct": 100.0
+  },
+  "scan": {
+    "count": 663,
+    "rate_hz": 15.0,
+    "age_ms": {
+      "mean": 1.3,
+      "p50": 1.2,
+      "p95": 2.1,
+      "max": 3.0
+    }
+  },
+  "opponent_odom": {
+    "count": 2222,
+    "rate_hz": 50.22,
+    "period_ms": {
+      "mean": 19.9,
+      "p50": 20.0,
+      "p95": 21.2,
+      "max": 24.4
+    },
+    "stamp_age_ms": {
+      "mean": 2.6,
+      "p50": 2.0,
+      "p95": 2.8,
+      "max": 194.8
+    }
+  }
+}

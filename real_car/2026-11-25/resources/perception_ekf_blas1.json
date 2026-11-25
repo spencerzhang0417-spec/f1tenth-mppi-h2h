@@ -1,0 +1,197 @@
+{
+  "note": "same, with OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 for both nodes",
+  "duration_s": 45.0,
+  "cores": 6,
+  "samples": 42,
+  "system": {
+    "cpu_freq_mhz": {
+      "mean": 994.2,
+      "p95": 1344,
+      "max": 1344
+    },
+    "cpu_max_core_pct": {
+      "mean": 51.44,
+      "p95": 64,
+      "max": 73
+    },
+    "cpu_total_pct_of_one_core": {
+      "mean": 178.45,
+      "p95": 194,
+      "max": 275
+    },
+    "gpu_pct": {
+      "mean": 30.87,
+      "p95": 98,
+      "max": 99
+    },
+    "power_cpu_gpu_w": {
+      "mean": 2.94,
+      "p95": 3.1,
+      "max": 3.53
+    },
+    "power_in_w": {
+      "mean": 8.58,
+      "p95": 8.8,
+      "max": 9.26
+    },
+    "ram_total_mb": {
+      "mean": 7546.0,
+      "p95": 7546,
+      "max": 7546
+    },
+    "ram_used_mb": {
+      "mean": 4017.82,
+      "p95": 4056,
+      "max": 4065
+    },
+    "swap_used_mb": {
+      "mean": 0.0,
+      "p95": 0,
+      "max": 0
+    },
+    "temp_cpu_c": {
+      "mean": 51.02,
+      "p95": 51.47,
+      "max": 51.78
+    },
+    "temp_gpu_c": {
+      "mean": 51.77,
+      "p95": 52.28,
+      "max": 52.69
+    },
+    "temp_tj_c": {
+      "mean": 51.77,
+      "p95": 52.28,
+      "max": 52.69
+    }
+  },
+  "cpu_all_pct_of_one_core": {
+    "mean": 180.09,
+    "p95": 189.6,
+    "max": 196.8
+  },
+  "this_script_cpu_pct_of_one_core": {
+    "mean": 5.67,
+    "p95": 6.6,
+    "max": 6.6
+  },
+  "groups": {
+    "perception": {
+      "processes": 1,
+      "cpu_pct_of_one_core": {
+        "mean": 73.41,
+        "p95": 76.5,
+        "max": 77.4
+      },
+      "rss_mb": {
+        "mean": 970.35,
+        "p95": 978.6,
+        "max": 978.6
+      }
+    },
+    "ekf": {
+      "processes": 1,
+      "cpu_pct_of_one_core": {
+        "mean": 37.1,
+        "p95": 40.6,
+        "max": 41.5
+      },
+      "rss_mb": {
+        "mean": 79.8,
+        "p95": 79.8,
+        "max": 79.8
+      }
+    },
+    "follow": {
+      "processes": 0,
+      "cpu_pct_of_one_core": {
+        "mean": 0.0,
+        "p95": 0.0,
+        "max": 0.0
+      },
+      "rss_mb": {
+        "mean": 0.0,
+        "p95": 0.0,
+        "max": 0.0
+      }
+    },
+    "lidar": {
+      "processes": 1,
+      "cpu_pct_of_one_core": {
+        "mean": 1.88,
+        "p95": 2.8,
+        "max": 3.8
+      },
+      "rss_mb": {
+        "mean": 40.6,
+        "p95": 40.6,
+        "max": 40.6
+      }
+    },
+    "vesc_stack": {
+      "processes": 4,
+      "cpu_pct_of_one_core": {
+        "mean": 11.0,
+        "p95": 13.1,
+        "max": 13.2
+      },
+      "rss_mb": {
+        "mean": 152.6,
+        "p95": 152.6,
+        "max": 152.6
+      }
+    },
+    "joy": {
+      "processes": 2,
+      "cpu_pct_of_one_core": {
+        "mean": 5.43,
+        "p95": 6.6,
+        "max": 8.5
+      },
+      "rss_mb": {
+        "mean": 113.2,
+        "p95": 113.2,
+        "max": 113.2
+      }
+    },
+    "latency_probe": {
+      "processes": 1,
+      "cpu_pct_of_one_core": {
+        "mean": 15.66,
+        "p95": 17.0,
+        "max": 17.9
+      },
+      "rss_mb": {
+        "mean": 76.94,
+        "p95": 77.1,
+        "max": 77.1
+      }
+    },
+    "ros2_launch": {
+      "processes": 2,
+      "cpu_pct_of_one_core": {
+        "mean": 0.06,
+        "p95": 0.9,
+        "max": 0.9
+      },
+      "rss_mb": {
+        "mean": 82.3,
+        "p95": 82.3,
+        "max": 82.3
+      }
+    },
+    "claude_agent": {
+      "processes": 2,
+      "cpu_pct_of_one_core": {
+        "mean": 0.11,
+        "p95": 0.9,
+        "max": 0.9
+      },
+      "rss_mb": {
+        "mean": 267.3,
+        "p95": 267.3,
+        "max": 267.3
+      }
+    }
+  }
+}

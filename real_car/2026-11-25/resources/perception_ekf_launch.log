@@ -1,0 +1,66 @@
+[INFO] [launch]: All log files can be found below /home/nvidia/.ros/log/2026-11-25-14-52-33-407143-ese6150-team5-car-39700
+[INFO] [launch]: Default logging verbosity is set to INFO
+/opt/ros/jazzy/lib/python3.12/site-packages/launch/conditions/launch_configuration_equals.py:53: UserWarning: The 'LaunchConfigurationEquals' and 'LaunchConfigurationNotEquals' Conditions are  deprecated. Use the 'EqualsSubstitution' and 'NotEqualsSubstitution' substitutions instead! E.g.:
+  IfCondition(
+  	EqualsSubstitution(LaunchConfiguration('some_launch_arg'), "some_equality_check")
+  )
+  warnings.warn(
+[INFO] [opponent_ekf_node.py-1]: process started with pid [39708]
+[INFO] [python-2]: process started with pid [39709]
+[opponent_ekf_node.py-1] [INFO] [1795636355.122747124] [opponent_ekf_node]: opponent EKF: /perception/car_observations + /odom + /sensors/imu/raw (up [0.0, 0.0, 1.0], scale 0.017453) -> /opponent/odom
+[python-2] [INFO] [1795636356.122472153] [car_observations]: Loaded engine: /home/nvidia/f1tenth_ws/install/vision_lab/share/vision_lab/models/rtdetrv2_fp16.engine
+[python-2] [INFO] [1795636356.123782837] [car_observations]: Publishing /perception/car_observations: measured surface points in laser (x forward, y left); one array per matched scan
+[python-2] [WARN] [1795636356.534888524] [car_observations]: Waiting for scan
+[opponent_ekf_node.py-1] [INFO] [1795636359.672365142] [opponent_ekf_node]: opponent (1.23, +0.07) m, heading +0 deg, speed -0.00 +- 0.58 m/s | 4.0 Hz, 20 points, latency 38 ms | frames: init 1, update 19 | dropped: none | ego 0.00 m/s, gyro bias -0.0029 rad/s
+[python-2] [INFO] [1795636361.012646289] [car_observations]: Observations: 7.9 Hz; cars: 1; scan age: 10 ms
+[opponent_ekf_node.py-1] [INFO] [1795636364.691416855] [opponent_ekf_node]: opponent (1.23, +0.07) m, heading +1 deg, speed -0.01 +- 0.62 m/s | 14.9 Hz, 75 points, latency 33 ms | frames: update 75 | dropped: none | ego 0.00 m/s, gyro bias -0.0035 rad/s
+[python-2] [INFO] [1795636366.073971031] [car_observations]: Observations: 15.0 Hz; cars: 1; scan age: 10 ms
+[opponent_ekf_node.py-1] [INFO] [1795636369.712099939] [opponent_ekf_node]: opponent (1.23, +0.07) m, heading +9 deg, speed 0.00 +- 0.66 m/s | 14.9 Hz, 75 points, latency 34 ms | frames: update 75 | dropped: none | ego 0.00 m/s, gyro bias -0.0037 rad/s
+[python-2] [INFO] [1795636371.143823006] [car_observations]: Observations: 15.0 Hz; cars: 1; scan age: 11 ms
+[opponent_ekf_node.py-1] [INFO] [1795636374.731530876] [opponent_ekf_node]: opponent (1.23, +0.07) m, heading +24 deg, speed 0.01 +- 0.69 m/s | 14.9 Hz, 76 points, latency 35 ms | frames: update 75 | dropped: none | ego 0.00 m/s, gyro bias -0.0037 rad/s
+[python-2] [INFO] [1795636376.206112871] [car_observations]: Observations: 14.0 Hz; cars: 1; scan age: 60 ms
+[opponent_ekf_node.py-1] [INFO] [1795636379.751444040] [opponent_ekf_node]: opponent (1.23, +0.07) m, heading +47 deg, speed -0.02 +- 0.59 m/s | 14.3 Hz, 72 points, latency 37 ms | frames: update 72 | dropped: none | ego 0.00 m/s, gyro bias -0.0038 rad/s
+[python-2] [INFO] [1795636381.279258917] [car_observations]: Observations: 15.2 Hz; cars: 1; scan age: 10 ms
+[opponent_ekf_node.py-1] [INFO] [1795636384.771780136] [opponent_ekf_node]: opponent (1.23, +0.07) m, heading +71 deg, speed 0.00 +- 0.62 m/s | 14.9 Hz, 75 points, latency 33 ms | frames: update 75 | dropped: none | ego 0.00 m/s, gyro bias -0.0034 rad/s
+[python-2] [INFO] [1795636386.333598801] [car_observations]: Observations: 15.0 Hz; cars: 1; scan age: 11 ms
+[opponent_ekf_node.py-1] [INFO] [1795636389.791941647] [opponent_ekf_node]: opponent (1.23, +0.07) m, heading +95 deg, speed -0.00 +- 0.66 m/s | 14.9 Hz, 76 points, latency 34 ms | frames: update 75 | dropped: none | ego 0.00 m/s, gyro bias -0.0033 rad/s
+[python-2] [INFO] [1795636391.334164051] [car_observations]: Observations: 15.0 Hz; cars: 1; scan age: 11 ms
+[opponent_ekf_node.py-1] [INFO] [1795636394.811999936] [opponent_ekf_node]: opponent (1.23, +0.07) m, heading +96 deg, speed 0.01 +- 0.69 m/s | 14.9 Hz, 75 points, latency 34 ms | frames: update 75 | dropped: none | ego 0.00 m/s, gyro bias -0.0032 rad/s
+[python-2] [INFO] [1795636396.344634073] [car_observations]: Observations: 15.0 Hz; cars: 1; scan age: 10 ms
+[opponent_ekf_node.py-1] [INFO] [1795636399.831706038] [opponent_ekf_node]: opponent (1.23, +0.07) m, heading +90 deg, speed -0.00 +- 0.61 m/s | 15.1 Hz, 76 points, latency 33 ms | frames: update 76 | dropped: none | ego 0.00 m/s, gyro bias -0.0036 rad/s
+[python-2] [INFO] [1795636401.397820014] [car_observations]: Observations: 15.0 Hz; cars: 1; scan age: 10 ms
+[opponent_ekf_node.py-1] [INFO] [1795636404.852517008] [opponent_ekf_node]: opponent (1.23, +0.07) m, heading +100 deg, speed -0.00 +- 0.65 m/s | 14.9 Hz, 75 points, latency 33 ms | frames: update 75 | dropped: none | ego 0.00 m/s, gyro bias -0.0035 rad/s
+[python-2] [INFO] [1795636406.403383619] [car_observations]: Observations: 15.0 Hz; cars: 1; scan age: 11 ms
+[opponent_ekf_node.py-1] [INFO] [1795636409.872550025] [opponent_ekf_node]: opponent (1.23, +0.07) m, heading +92 deg, speed 0.00 +- 0.56 m/s | 15.1 Hz, 76 points, latency 33 ms | frames: update 76 | dropped: none | ego 0.00 m/s, gyro bias -0.0034 rad/s
+[python-2] [INFO] [1795636411.409941757] [car_observations]: Observations: 15.0 Hz; cars: 1; scan age: 10 ms
+[opponent_ekf_node.py-1] [INFO] [1795636414.892422124] [opponent_ekf_node]: opponent (1.23, +0.07) m, heading +85 deg, speed -0.00 +- 0.60 m/s | 14.9 Hz, 75 points, latency 33 ms | frames: update 75 | dropped: none | ego 0.00 m/s, gyro bias -0.0034 rad/s
+[python-2] [INFO] [1795636416.481603213] [car_observations]: Observations: 15.0 Hz; cars: 1; scan age: 10 ms
+[opponent_ekf_node.py-1] [INFO] [1795636419.912089915] [opponent_ekf_node]: opponent (1.23, +0.07) m, heading +83 deg, speed 0.00 +- 0.63 m/s | 14.9 Hz, 75 points, latency 33 ms | frames: update 75 | dropped: none | ego 0.00 m/s, gyro bias -0.0035 rad/s
+[python-2] Traceback (most recent call last):
+[python-2]   File "/home/nvidia/f1tenth_ws/install/vision_lab/lib/vision_lab/car_observations.py", line 229, in <module>
+[python-2]     main()
+[python-2]   File "/home/nvidia/f1tenth_ws/install/vision_lab/lib/vision_lab/car_observations.py", line 218, in main
+[python-2]     rclpy.spin(node)
+[python-2]   File "/opt/ros/jazzy/lib/python3.12/site-packages/rclpy/__init__.py", line 247, in spin
+[python-2]     executor.spin_once()
+[python-2]   File "/opt/ros/jazzy/lib/python3.12/site-packages/rclpy/executors.py", line 926, in spin_once
+[python-2]     self._spin_once_impl(timeout_sec)
+[python-2]   File "/opt/ros/jazzy/lib/python3.12/site-packages/rclpy/executors.py", line 918, in _spin_once_impl
+[python-2]     raise handler.exception()
+[python-2]   File "/opt/ros/jazzy/lib/python3.12/site-packages/rclpy/task.py", line 286, in _execute_coroutine_step
+[python-2]     result = coro.send(None)
+[python-2]              ^^^^^^^^^^^^^^^
+[python-2]   File "/opt/ros/jazzy/lib/python3.12/site-packages/rclpy/executors.py", line 592, in handler
+[python-2]     await call_coroutine()
+[python-2]   File "/opt/ros/jazzy/lib/python3.12/site-packages/rclpy/executors.py", line 454, in _execute
+[python-2]     await await_or_execute(tmr.callback)
+[python-2]   File "/opt/ros/jazzy/lib/python3.12/site-packages/rclpy/executors.py", line 115, in await_or_execute
+[python-2]     return callback(*args)
+[python-2]            ^^^^^^^^^^^^^^^
+[python-2]   File "/home/nvidia/f1tenth_ws/install/vision_lab/lib/vision_lab/car_observations.py", line 196, in observe
+[python-2]     self.publisher.publish(message)
+[python-2]   File "/opt/ros/jazzy/lib/python3.12/site-packages/rclpy/publisher.py", line 70, in publish
+[python-2]     self.__publisher.publish(msg)
+[python-2] rclpy._rclpy_pybind11.RCLError: Failed to publish: publisher's context is invalid, at ./src/rcl/publisher.c:423
+[INFO] [opponent_ekf_node.py-1]: process has finished cleanly [pid 39708]
+[ERROR] [python-2]: process has died [pid 39709, exit code 1, cmd '/home/nvidia/vision-env/bin/python /home/nvidia/f1tenth_ws/install/vision_lab/lib/vision_lab/car_observations.py --ros-args --params-file /tmp/launch_params_rch_5e9h --params-file /tmp/launch_params_ekkc1y2f'].

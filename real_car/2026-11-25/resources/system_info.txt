@@ -1,0 +1,10 @@
+NV Power Mode: 25W
+governor: schedutil, 729600-1344000 kHz
+NVIDIA Jetson Orin Nano Engineering Reference Developer Kit Super
+# R39 (release), REVISION: 2.1, GCID: 46758480, BOARD: generic, EABI: aarch64, DATE: Fri Aug  7 05:54:22 AM UTC 2026
+kernel 6.8.12-1021-tegra, 6 cores
+               total        used        free      shared  buff/cache   available
+Mem:            7546        3660        1023         155        3243        3885
+Swap:           2047           0        2047
+numpy (ROS nodes): 1.26.4
+measured 2026-11-25T14:52:11-05:00

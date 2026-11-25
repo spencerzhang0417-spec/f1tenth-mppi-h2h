@@ -1,0 +1,38 @@
+{
+  "frames": 300,
+  "camera": "/dev/video4 960x540 YUYV @ 60 fps",
+  "engine": "rtdetrv2_fp16.engine",
+  "stages": {
+    "camera_read": {
+      "mean_ms": 1.25,
+      "p50_ms": 1.4,
+      "p95_ms": 1.71,
+      "max_ms": 2.13
+    },
+    "detect": {
+      "mean_ms": 36.64,
+      "p50_ms": 36.73,
+      "p95_ms": 38.53,
+      "max_ms": 39.44
+    },
+    "project_scan": {
+      "mean_ms": 0.63,
+      "p50_ms": 0.62,
+      "p95_ms": 0.68,
+      "max_ms": 0.99
+    },
+    "estimate_position": {
+      "mean_ms": 0.36,
+      "p50_ms": 0.36,
+      "p95_ms": 0.4,
+      "max_ms": 0.56
+    },
+    "loop_without_waiting_for_scan": {
+      "mean_ms": 38.88,
+      "p50_ms": 38.89,
+      "p95_ms": 40.78,
+      "max_ms": 42.2
+    }
+  },
+  "free_running_rate_hz": 25.7
+}
